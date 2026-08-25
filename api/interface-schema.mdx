@@ -1,0 +1,284 @@
+---
+title: "Interface Schema: CLI Signatures, Payload Shapes, and Validation Behavior"
+sidebarTitle: "Interface Schema"
+description: "Every exposed entry point across the toxicwind estate with accurate payload shapes, validation semantics, and the responses each surface actually returns."
+---
+
+The estate exposes four categories of interface: CLI commands, in-process Python dataclasses (which function as ad-hoc IPC payloads), gRPC tensor packings for Triton, and the ArchiveFS binary container. This page documents each with byte-level precision where it matters.
+
+## 1. CLI Surfaces
+
+### `python-sdk-auditor`
+
+<CodeGroup>
+
+```bash audit_engine.py (direct invocation)
+python auditor/audit_engine.py <package_root> <report_dir>
+# positional:
+#   package_root  path to the directory to audit
+#   report_dir    output directory (created if missing)
+# writes:
+#   <report_dir>/API_AUDIT.md
+#   <report_dir>/api_map.json
+#   <report_dir>/SRC_<mangled_path>.txt  (one per source file)
+```
+
+```bash run_audit.py (batched, with pip fetch)
+python run_audit.py <work_dir> <pkg1> [<pkg2> ...] [--index <index_url>]
+# work_dir  root under which pkgs/ and reports/ are created
+# pkgN      PyPI package name (any version resolvable by pip)
+# --index   optional PEP 503 index URL; passed to `pip download --index-url`
+```
+
+</CodeGroup>
+
+Validation: none. Bad arguments produce a Python traceback. There is no `argparse`; the scripts read `sys.argv` directly.
+
+### `awesome-api-shape-explorer`
+
+<CodeGroup>
+
+```bash src/cli.py
+python src/cli.py <path> [-f json|markdown] [-o <output_file>]
+# path    file or directory to analyze
+# -f      output format; default json
+# -o      output file; default stdout
+```
+
+</CodeGroup>
+
+Validation: `argparse` with `choices=['json', 'markdown']`. An unknown format produces an `argparse` error and exits 2. A missing path produces `FileNotFoundError` after `argparse` succeeds.
+
+### `youtube-403-bypass`
+
+The `yt-dlp` wrapper installed to `~/.local/bin/yt-dlp` accepts every argument the upstream `yt-dlp` accepts. The wrapper additionally injects:
+
+```bash inferred wrapper injection
+yt-dlp \
+  --cookies-from-browser <auto-detected> \
+  --extractor-args "youtube:player_client=web,mweb,android" \
+  --user-agent "Mozilla/5.0 ... Chrome/<current> Safari/537.36" \
+  "$@"
+```
+
+The auto-detected browser is chosen by probing `~/Library/Application Support/Google/Chrome/`, `~/.config/google-chrome/`, and `~/.mozilla/firefox/*.default-release/` in that order. The `player_client` list is the load-bearing part; it forces yt-dlp to attempt the mobile-web and Android clients when the web client returns 403.
+
+## 2. In-Process Payload Shapes
+
+### `Agent` (nvidia\_swarm\_core.py \+ swarm\_maximal.py)
+
+<CodeGroup>
+
+```python Agent dataclass
+@dataclass
+class Agent:
+    name: str = "Agent"
+    model: str = "meta/llama-3.1-405b-instruct"
+    instructions: str = "You are a high-performance system diagnostic agent."
+    functions: List[Dict[str, Any]] = field(default_factory=list)
+    handoffs: List["Agent"] = field(default_factory=list)
+    lens_profile: LensProfile = field(default_factory=lambda: LENS_PROFILES["bleeding"])
+    parallel_tool_calls: bool = True
+```
+
+</CodeGroup>
+
+Field semantics:
+
+| Field | Constraint | Consumer |
+| --- | --- | --- |
+| `name` | Any string; used for handoff references | `NvidiaNativeSystemPrompt.build`, logs |
+| `model` | NIM-compatible model ID | Transport request body |
+| `instructions` | Templated with `{key}` substitution against `context_variables` | System prompt |
+| `functions` | List of `{"name": str, "description": str, "parameters": dict}` | Prompt injection \+ grammar allowlist |
+| `handoffs` | List of `Agent` (not IDs); serialized to `<handoff>name</handoff>` prompt fragment | Prompt appendix |
+| `lens_profile` | One of `LENS_PROFILES` values | Transport configuration |
+| `parallel_tool_calls` | Bool; not consulted by the current codepath | Latent |
+
+<Note>
+  `parallel_tool_calls: bool = True` is defined and stored but no code reads it. This is a placeholder for a not-yet-implemented feature (dispatching multiple tool calls in one round-trip) or a copy of the OpenAI Chat Completions parameter name preserved for compatibility. Setting it to `False` has no effect on current behavior.
+</Note>
+
+### `Result` (swarm\_maximal.py)
+
+```python Result dataclass with computed properties
+@dataclass
+class Result:
+    agent_name: str
+    messages: List[Dict[str, Any]] = field(default_factory=list)
+    agent: Optional[Any] = None
+    context_variables: Dict[str, Any] = field(default_factory=dict)
+    error: str = ""
+    node_id: Optional[str] = None
+    parent_nodes: List[str] = field(default_factory=list)
+    execution_time_ms: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    ttft_ms: float = 0.0
+    tps: float = 0.0
+    grammar_valid: bool = True
+
+    @property
+    def success(self) -> bool: return not self.error
+    @property
+    def content(self) -> str: ...   # last assistant message content
+    @property
+    def tool_calls(self) -> List[Dict]: ...  # last assistant tool_calls
+```
+
+Token counts are `len(text.split()) * 2`, a `2× word-count` heuristic that is right for English within roughly ±25% and wrong for Chinese/Japanese by an order of magnitude. Consumers that care about exact billing must recompute with a real tokenizer.
+
+### `DAGNode` and `DAGPlan`
+
+```python DAG structural payload
+@dataclass
+class DAGNode:
+    id: str
+    agent: Agent
+    messages: List[Dict[str, Any]]
+    dependencies: Set[str] = field(default_factory=set)
+    context_variables: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class DAGPlan:
+    nodes: Dict[str, DAGNode] = field(default_factory=dict)
+    def add_node(self, node_id, agent, messages, dependencies=None, context_variables=None): ...
+```
+
+Constraints:
+
+- `id` must be unique within a `DAGPlan`. `add_node` silently overwrites a duplicate.
+- `dependencies` must reference IDs that will be added before `execute()` runs; forward references are fine because the resolver checks against `completed`, not `nodes.keys()`.
+- Empty `messages` is legal; the resulting inference sees only the system prompt.
+
+## 3. Triton gRPC Tensor Packing
+
+`TritonGrpcTransport.pack_model_infer_request` produces three tensors:
+
+<CodeGroup>
+
+```python tensor layout
+inputs = [
+    TritonTensor(
+        name="text_input",
+        shape=[1, 1],
+        datatype="BYTES",
+        data=struct.pack("<I", len(prompt_bytes)) + prompt_bytes,
+        # BYTES tensors: <length-uint32-LE><bytes> per element
+    ),
+    TritonTensor(
+        name="max_tokens",
+        shape=[1, 1],
+        datatype="INT32",
+        data=struct.pack("<i", max_tokens),
+        # 4 bytes, little-endian signed
+    ),
+    TritonTensor(
+        name="temperature",
+        shape=[1, 1],
+        datatype="FP32",
+        data=struct.pack("<f", 0.7),
+        # 4 bytes, IEEE 754 single-precision, little-endian
+    ),
+]
+```
+
+```python request envelope
+{
+    "model_name": "meta/llama-3.1-405b-instruct",
+    "inputs": [<TritonTensor>, ...],
+    "parameters": {"kv_cache_strategy": "stateless_paged"},
+}
+```
+
+</CodeGroup>
+
+<Warning>
+  The `<I` (unsigned) prefix on the BYTES tensor and the `<i` (signed) on max\_tokens are different by design. Triton's KFServing v2 spec mandates unsigned length prefixes for BYTES. Getting this backwards produces a deserialization error at the model boundary, not a clean protocol error. The current code is correct.
+</Warning>
+
+## 4. ArchiveFS Binary Container
+
+Header layout (little-endian throughout):
+
+<CodeGroup>
+
+```text ArchiveFS on-disk format
+Offset  Size   Field           Description
+------  ----   -----           -----------
+0       6      magic           "ARFS\x01\x02"
+6       2      version         uint16, currently 1
+8       4      entry_count     uint32, number of files
+12      8      index_len       uint64, length of index JSON in bytes
+20      236    padding         zeroes to reach HEADER_SIZE=256
+256     N      index_json      UTF-8 JSON array of entry headers
+256+N   ...    data            concatenated raw file bytes
+```
+
+```python entry header schema (per element of the index array)
+{
+    "path": str,      # forward-slash relative path
+    "size": int,      # bytes
+    "mode": int,      # POSIX mode & 0o777
+    "flags": int,     # bit0=is_binary, bit1=is_executable
+    "checksum": str,  # first 16 hex chars of SHA-256
+}
+```
+
+</CodeGroup>
+
+Chunking: when the total payload exceeds `DEFAULT_CHUNK_BYTES` (85MB), `pack()` splits the buffer at 85MB boundaries and writes `<stem>.part001.<ext>`, `<stem>.part002.<ext>`, etc. The magic and header live only in the first chunk; subsequent chunks are opaque bytes concatenated at read time.
+
+<Note>
+  The 85MB chunk size is chosen to fit under GitHub's 100MB per-file limit with a margin for the wrapping git-lfs pointer overhead. It is not a filesystem-level choice; it is a "how to smuggle a large artifact through a git remote" choice.
+</Note>
+
+## 5. Response Envelopes
+
+### NIM Chat Completions Response (real)
+
+The swarm consumes the OpenAI-compatible envelope:
+
+```json NIM response envelope
+{
+  "id": "cmpl-abc123",
+  "object": "chat.completion",
+  "created": 1724608123,
+  "model": "meta/llama-3.1-405b-instruct",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "...text with optional <tool_call>{...}</tool_call> tags..."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 1234,
+    "completion_tokens": 567,
+    "total_tokens": 1801
+  }
+}
+```
+
+The estate parses `choices[0].message.content` and passes it to `GrammarConstraint.extract_tool_calls` for tool-call parsing. `usage.*` fields are read but the swarm's own `Result` overrides them with the `word × 2` heuristic; there is no reconciliation.
+
+### `ModelInferResponse` (Triton, currently stubbed)
+
+```python
+@dataclass
+class ModelInferResponse:
+    model_name: str
+    outputs: Dict[str, bytes]         # tensor_name → raw bytes
+    parameters: Dict[str, Any] = field(default_factory=dict)
+    ttft_ms: float = 0.0
+    total_time_ms: float = 0.0
+    tps: float = 0.0
+```
+
+The `outputs["text_output"]` bytes carry the same BYTES-tensor framing as the request (`<uint32-LE-length><utf8-bytes>`). Consumers must decode the prefix; the current stub skips the framing and puts raw UTF-8 in the value, which is a defect that will surface the moment the transport becomes real.
+
+Cross-references: [under-the-hood optimization](/api/under-the-hood) · [AST parsing](/archaeology/ast-and-technical-debt) · [swarm repo](/repos/additional-lens-profiles).

@@ -1,0 +1,181 @@
+---
+title: "Under-the-Hood Optimization: Semaphores, KV Cache, and Discarded Cycles"
+sidebarTitle: "Under the Hood"
+description: "Where the toxicwind estate optimizes for throughput (semaphores, TCP pooling, KV cache hints) and where it casually discards compute cycles."
+---
+
+Three optimization surfaces exist in this estate: `asyncio.Semaphore` for concurrency control, `aiohttp.TCPConnector` for connection reuse, and the (mostly aspirational) KV cache hints passed as NIM request parameters. Each is instrumented for a specific bottleneck; the composition is uneven.
+
+## The Semaphore Ceiling
+
+`nvidia_swarm_core.py` and `swarm_maximal.py` both use a single semaphore to bound in-flight inference:
+
+<CodeGroup>
+
+```python nvidia_swarm_core.py
+class NvidiaSwarmDAG:
+    def __init__(self, ...):
+        self.semaphore = asyncio.Semaphore(16)
+        self.connector = aiohttp.TCPConnector(limit=32)
+        ...
+```
+
+```python swarm_maximal.py
+class TritonGrpcTransport:
+    def __init__(self, ..., profile=None):
+        self.profile = profile or LENS_PROFILES["bleeding"]
+        self.semaphore = asyncio.Semaphore(self.profile.concurrency)
+```
+
+</CodeGroup>
+
+The core swarm caps at 16; the maximal artifact scales up to 128. Both are single-lock designs; there is no per-endpoint or per-model sub-semaphore. Consequence: if a run mixes `llama-3.1-405b-instruct` (slow) and `nemotron-nano-30b-a3b-reasoning` (fast), the fast model's throughput is pinned by the slow model's occupancy, because a stuck 405B request holds a slot the nano model could otherwise use.
+
+<Note>
+  The rational fix is a `dict[str, asyncio.Semaphore]` keyed by model, with per-model limits. The estate does not do this because in practice each swarm run is single-model; the mixed case is a theoretical concern, not an observed workload.
+</Note>
+
+### Semaphore vs TCPConnector Ratio
+
+```text observed pattern (core swarm)
+asyncio.Semaphore(16)          ← application-level concurrency
+aiohttp.TCPConnector(limit=32) ← transport-level pool
+```
+
+The 2:1 ratio is deliberate. It means every inference has at least one free connection available, and there is headroom for one keepalive per active request plus one for pending. Setting `TCPConnector(limit=16)` would produce visible latency spikes at high semaphore utilization; setting it to 64 would waste TLS session state. 32 is the smallest defensible number.
+
+## Topological Ready-Set Expansion
+
+`LensSwarmOrchestrator.execute` uses a topological-sort variant that recomputes the ready set on every iteration:
+
+<CodeGroup>
+
+```python execute loop
+async def execute(self) -> Dict[str, Result]:
+    completed: Set[str] = set()
+    pending = dict(self.plan.nodes)
+    while pending:
+        ready = [node for node in pending.values() if node.dependencies.issubset(completed)]
+        if not ready:
+            raise RuntimeError("Deadlock or circular dependency detected in Lens DAG plan.")
+        tasks = [self._execute_node(node) for node in ready]
+        batch = await asyncio.gather(*tasks)
+        for node, res in zip(ready, batch):
+            self.results[node.id] = res
+            completed.add(node.id)
+            del pending[node.id]
+    return self.results
+```
+
+</CodeGroup>
+
+This is `O(V·E)` worst case: on each iteration, every pending node's dependency set is checked against the completed set. For a DAG of 50 nodes and 200 edges (representative of a full case-study run) this is a rounding error compared to the network I/O it gates. For a 5000-node DAG it would be a real cost. The estate never runs 5000-node DAGs.
+
+The correct algorithm is Kahn's: maintain an incoming-edge count per node and an explicit ready queue. This would drop the complexity to `O(V + E)`. It would also require ~40 more lines of code and produce identical wall-clock behavior at current scale. The trade-off is deliberate.
+
+## KV Cache Hints: Signaling Without Enforcement
+
+The Triton request envelope contains a `"kv_cache_strategy": "stateless_paged"` parameter. This is not a strategy the client selects; it is a hint the client sends and the server may honor or ignore.
+
+<Accordion title="What 'stateless_paged' means on NIM">
+  Paged attention (vLLM origin, 2023) divides the KV cache into fixed-size blocks and manages them like OS memory pages. `stateless` here means the server does not persist per-request state across `infer()` calls; each request is treated as fresh.
+
+  The alternative would be `stateful` (or `session-cached`) where the client sends a session ID and the server retains the KV cache between calls, dramatically reducing prompt-reprocessing cost for multi-turn conversations. NIM supports this on some deployments; the swarm does not use it because DAG nodes do not have multi-turn conversations, they have single-shot inferences that merge parent results into the next prompt manually.
+
+  Sending the `stateless_paged` hint is redundant on a NIM endpoint that already defaults to stateless. It costs nothing and documents intent, which is the honest reason it is there.
+</Accordion>
+
+## The KV Cache the Estate Actually Uses: Prompt Merging
+
+The real optimization is at the prompt-construction layer. When a DAG node has parent dependencies, the parent outputs are merged into the child's context:
+
+```python _execute_node parent merge
+parent_ctx = {}
+for dep in node.dependencies:
+    if dep in self.results:
+        parent_ctx[dep] = self.results[dep].content
+ctx = {**node.context_variables, **parent_ctx}
+sys_prompt = agent.get_system_prompt(ctx)
+```
+
+If the same parent content is referenced by five children, the parent's text is serialized into five distinct system prompts. The server's paged-attention cache may hit on the shared prefix (system prompt boilerplate) but will miss on the diverging parent content. The estate does not attempt to exploit prefix caching by grouping children by shared context.
+
+The optimization would be:
+
+1. Sort children by their dependency signature.
+2. Issue children with identical dependencies in a batch.
+3. Rely on server-side prefix caching to deduplicate the shared prompt prefix.
+
+This is the correct optimization for prefix-caching servers (SGLang, vLLM prefix-caching mode). It is not implemented. The gain would be roughly 15-30% throughput on wide DAGs. The estate leaves the cycles on the floor.
+
+## Token-Count Heuristic: Cycles Discarded on Purpose
+
+Both swarm implementations count tokens as `len(text.split()) * 2`:
+
+```python token counting
+input_tokens=len(prompt_text.split()) * 2,
+output_tokens=len(content.split()) * 2,
+total_tokens=(len(prompt_text.split()) + len(content.split())) * 2,
+```
+
+A real tokenizer round-trip for a 4KB prompt takes ~5ms on a laptop with `tiktoken`. Multiplied by 128 concurrent requests, that is 640ms of interpreter time per batch iteration, and the estate refuses to pay it. The `× 2` heuristic is 25-40% off for English and unusably wrong for CJK, but it is stable, deterministic, and free.
+
+<Warning>
+  Any downstream consumer that bills against these token counts (a hypothetical cost report, a per-agent budget guard) is off by 25-40%. This is documented in [interface schema](/api/interface-schema); it is worth re-stating because the numbers look precise and are not.
+</Warning>
+
+## Tokenize to Regex Fallback Ladder (auditor)
+
+`audit_engine.py` demonstrates the estate's typical fallback discipline:
+
+```text auditor fallback ladder
+1. Try ast.parse(src)
+   ├── success → ast.walk for imports, classes, functions
+   └── SyntaxError → record AST_PARSE_FAIL, continue with empty Module
+
+2. Try tokenize.generate_tokens for comments
+   ├── success → harvest COMMENT tokens
+   └── TokenError | IndentationError → fall through
+
+3. Regex `#[^\n]*` for comments (final fallback)
+```
+
+Three attempts, each cheaper than the previous, and each producing degraded but still usable output. The pattern is not clever, it is disciplined. It is also what distinguishes this estate from most solo-author Python: the author refuses to let a single parse failure kill the whole run.
+
+## Where Cycles Are Genuinely Optimized
+
+<Accordion title="GitHub rate-limit preemption in sovereign_helper">
+  `RateLimit` parses `X-RateLimit-Remaining` and `X-RateLimit-Reset` headers on every response. When remaining drops below a threshold, the client can sleep before the next request instead of waiting for a 403. This is the single most surgical optimization in the estate.
+</Accordion>
+
+<Accordion title="TCPConnector with HTTP/2 pipelining">
+  `aiohttp.TCPConnector(limit=32)` with `httpx[http2]` extras means keepalive is maintained across the 32 connections for the process lifetime. TLS handshake amortizes to less than 0.1% of total request cost at steady state.
+</Accordion>
+
+<Accordion title="Subprocess crash isolation as a throughput multiplier">
+  Not usually thought of as an optimization, but relevant: a segfault in `fetch_pkgs.py` under `pip download` used to kill the whole run. Isolating the subprocess means the auditor completes 99% of a 100-package batch even when one package's `setup.py` crashes. The 1% cost of subprocess spawn is repaid by the 99% completion.
+</Accordion>
+
+## Where Cycles Are Discarded
+
+<Accordion title="No prefix-cache-aware DAG scheduling">
+  Roughly 15-30% throughput left on the floor for wide DAGs.
+</Accordion>
+
+<Accordion title="Token count heuristic instead of tokenizer">
+  Correct choice for latency, but downstream consumers assume the counts are real.
+</Accordion>
+
+<Accordion title="O(V·E) topological sort">
+  Fine at current scale, would matter at 1000\+ nodes.
+</Accordion>
+
+<Accordion title="Single global semaphore across model tiers">
+  Mixed-tier runs pay the slow-tier tax on the fast tier.
+</Accordion>
+
+<Accordion title="Repeated regex compilation per file (auditor)">
+  Ten `re.search` calls per file with the pattern string, not a pre-compiled `Pattern`. On 5000 files this is roughly 200ms wasted. Fixable in three lines. Not fixed.
+</Accordion>
+
+Cross-references: [interface schema](/api/interface-schema) · [failure vectors](/pipelines/failure-vectors) · [dependency lifecycle](/archaeology/state-and-dependency-lifecycle).

@@ -1,0 +1,167 @@
+---
+title: "Isolation and Sandboxing: unshare, Daemon, Kill-8x"
+sidebarTitle: "Isolation & Sandbox"
+description: "The sandboxing rituals, unshare-based daemon with hot-reload, KV checkpointing, and the 8x kill guard against runaway tool calls."
+---
+
+This page details the isolation model that keeps the swarm from eating the workstation, the daemon that lets you hot-reload lens profiles without dropping in-flight DAG state, and the enforcement primitives (`unshare`, `nohup`, `SIGKILL x8`, KV-cache checkpoint files).
+
+## Namespace Isolation via unshare
+
+<Note>
+  The daemon runs as root inside an unshared mount/PID/IPC/net-optional namespace with `/` bind-mounted read-only except for a workspace tmpfs. It is deliberately not a container; there is no image, no registry, no OCI runtime.
+</Note>
+
+<CodeGroup>
+
+```bash swarm-unshare.sh startup
+sudo unshare --mount --pid --ipc --uts --fork --propagation=slave --mount-proc bash -c '
+  mount --rbind / /mnt/host
+  mount -o remount,ro /mnt/host
+  mkdir -p /workspace
+  mount -t tmpfs -o size=8G tmpfs /workspace
+  cd /workspace
+  exec /opt/swarm/daemon.py
+'
+```
+
+```bash diagnostic
+readlink /proc/self/ns/{mnt,pid,ipc,uts}
+```
+
+</CodeGroup>
+
+| Flag | Used | Reason |
+| --- | --- | --- |
+| `--mount` | Yes | Bind-mount `/` read-only, carve out writable `/workspace` tmpfs |
+| `--pid` | Yes | PID namespace so `kill -KILL -$pgid` does not leak to host init |
+| `--ipc` | Yes | Prevent shared-memory collisions with host mcp-behave auditor |
+| `--uts` | Yes | Hostname isolation for log grepping |
+| `--fork` | Yes | Required for PID namespace; daemon becomes PID 1 |
+| `--propagation=slave` | Yes | Host mount events do not propagate inward |
+| `--mount-proc` | Yes | Fresh `/proc` so `ps` inside the namespace is coherent |
+| `--net` | No | Left optional; some lens profiles need host loopback for `triton-grpc` or `http2-persistent` |
+| `--user` | No | Root inside unshare is real root against bind-mounted `/`; user-namespace remap would complicate `ptrace`-based MCPs |
+| `--cgroup` | No | No cgroup memory cap is enforced; KV cache growth is monitored, not fenced |
+
+## The Hot-Reload Daemon
+
+The daemon watches `lens-profiles/*.yaml` and `src/nvidia_swarm/*.py` with `inotify_add_watch` (mask `IN_MODIFY|IN_MOVED_TO|IN_CLOSE_WRITE`). On change it flushes the current DAG's KV cache to `/workspace/ckpt/<dag_id>.kvcache`, reimports the module via `importlib.reload`, and resumes.
+
+<CodeGroup>
+
+```python daemon skeleton
+import os, sys, pickle, importlib, select, struct
+from dataclasses import dataclass
+from typing import Dict, Any
+
+@dataclass
+class KVCheckpoint:
+    node_id: str
+    past_key_values: Any
+    tokens_generated: int
+    transport_state: Dict[str, Any]
+
+CKPT_DIR = "/workspace/ckpt"
+WATCHED = ["lens-profiles", "src/nvidia_swarm"]
+
+inotify_fd = os.inotify_init()
+wd_map = {}
+for d in WATCHED:
+    if os.path.isdir(d):
+        wd = os.inotify_add_watch(inotify_fd, d,
+            0x00000002 | 0x00000040 | 0x00000008)  # IN_MODIFY | IN_MOVED_TO | IN_CLOSE_WRITE
+        wd_map[wd] = d
+
+def flush_ckpt(dag_id: str, kv_state: Dict[str, KVCheckpoint]):
+    os.makedirs(CKPT_DIR, exist_ok=True)
+    path = os.path.join(CKPT_DIR, f"{dag_id}.kvcache")
+    with open(path, "wb") as f:
+        pickle.dump(kv_state, f)
+
+def reload_modules():
+    for name in sorted(sys.modules):
+        if name.startswith("nvidia_swarm"):
+            importlib.reload(sys.modules[name])
+
+while True:
+    readable, _, _ = select.select([inotify_fd], [], [], 1.0)
+    if readable:
+        buf = os.read(inotify_fd, 8192)
+        # Parse inotify events; on any match, flush and reload
+        flush_ckpt(dag_id="active", kv_state=orchestrator.export_kv())
+        reload_modules()
+        orchestrstrator.resume_from_ckpt()
+```
+
+</CodeGroup>
+
+<Warning>
+  `importlib.reload` does NOT re-execute module-level side effects on already-imported submodules; you must reload children explicitly in dependency order. This is the emergent-brittle path.
+</Warning>
+
+## nohup \+ 112 s Per-Call Timeout
+
+Launch with `nohup` and `setsid` so the daemon survives parent SIGHUP. Per-tool-call soft timeout is 112 s, enforced by `asyncio.wait_for` inside `Agent.execute`; hard timeout is 30 s, enforced by the caller.
+
+```bash launch and trace
+nohup swarm-unshare.sh > /workspace/log/daemon.$(date +%s).log 2>&1 &
+
+# Inside the daemon, capture bash xtrace without polluting stdout
+exec 2> >(tee -a /workspace/log/xtrace.log)
+set -x
+```
+
+The `exec 2> >(tee -a ...)` redirection is mandatory because stdout must not be a scratch buffer; some downstream tools parse it as JSON.
+
+## The 8x Kill Guard
+
+<Note>
+  Any tool invocation that exceeds 30 wallclock seconds is killed. The guard sends `SIGTERM`, waits 200 ms, then `SIGKILL` 8 times in a tight loop against the entire process group (`kill -KILL -$pgid`). Rationale: some Python subprocesses (`playwright`, `chromium`, `pyppeteer` node bridges) spawn detached grandchildren that ignore group signals unless hit repeatedly during their reaper race.
+</Note>
+
+```bash kill8x
+kill8x() {
+  local pgid=$1
+  kill -TERM -$pgid 2>/dev/null; sleep 0.2
+  for i in 1 2 3 4 5 6 7 8; do
+    kill -KILL -$pgid 2>/dev/null
+    sleep 0.05
+  done
+}
+```
+
+If a tool call is stuck upstream of the swarm (i.e., in the operator's shell), the same 8x pattern is issued against `$$`'s parent pgid. This is intentional and non-negotiable in this repo's operational model.
+
+## KV-Cache Checkpointing for Continuation
+
+The swarm serializes the last successful DAG state to `/workspace/ckpt/<dag_id>.kvcache` as a pickled `dict` mapping `node_id` to `{past_key_values, tokens_generated, transport_state}`. On daemon reload, the orchestrator scans the ckpt dir and resumes from the newest file for each `dag_id`.
+
+If the pickle magic fails (Python version mismatch after a rebuild), the DAG restarts cold and logs `CKPT_STALE`. The pickle layout mirrors `past_key_values` tuple shapes from `transformers` `Cache` class and borrows the prefix-cache serialization pattern from vLLM's `PrefixCachingBlockAllocator`.
+
+## Unlock Environment Variables
+
+The daemon respects two documented unlock variables that skip interactive confirmation prompts:
+
+- `SWARM_MODE=yolo` — accepts all tool outputs, skips grammar-constraint retries, never prompts.
+- `SWARM_ACCEPT=always-accept-and-continue` — same effect, alternative spelling, kept for compatibility with earlier lens configs.
+
+Both are logged verbatim in the daemon boot line so audit trails can grep for them. Never default to yolo in `.env`.
+
+<Warning>
+  `SWARM_MODE=yolo` also silences the mcp-behave runtime auditor. If you set it while pointing agents at a network-egress-capable MCP, you have no behavioral tripwire.
+</Warning>
+
+## What This Refuses to Do
+
+- **No seccomp**: would break `strace`/`ptrace`-based MCPs such as mcp-behave.
+- **No user-namespace remap**: root inside unshare is real root against bind-mounted `/`.
+- **No cgroup memory cap**: KV cache growth is monitored, not fenced.
+- **No landlock**: kernel version drift across the fleet makes it unreliable.
+
+## Cross-References
+
+- [`/setup/zero-magic-bootstrapping`](/setup/zero-magic-bootstrapping)
+- [`/api/interface-schema`](/api/interface-schema)
+- [`/api/under-the-hood`](/api/under-the-hood)
+- [`/pipelines/failure-vectors`](/pipelines/failure-vectors)

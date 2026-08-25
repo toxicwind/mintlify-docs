@@ -1,0 +1,242 @@
+---
+title: "Zero-Magic Bootstrapping: The Ritual Incantations"
+sidebarTitle: "Zero-Magic Bootstrap"
+description: "Sequential bash blocks for initializing each toxicwind repository, treating the setup process as the fragile ritual it actually is."
+---
+
+The estate provides no unified installer. Each repository ships its own bootstrap sequence, and each sequence assumes the previous run of some other script left the environment in a specific state. This page enumerates the incantations in the exact order they must be uttered.
+
+## Ritual 0: Sanctify the Host
+
+Before touching any repository:
+
+<Steps>
+  <Step title="Confirm Python 3.11 or 3.12 is on PATH">
+    ```bash
+    python3 --version   # must print 3.11.x or 3.12.x
+    ```
+
+    If not, `pyenv install 3.12.5 && pyenv global 3.12.5`. Anything older breaks `asyncio.timeout()` and the `|`-typed annotations in `sovereign_helper.py`.
+  </Step>
+  <Step title="Create the shared virtualenv">
+    ```bash
+    mkdir -p ~/.venvs
+    python3 -m venv ~/.venvs/toxicwind
+    source ~/.venvs/toxicwind/bin/activate
+    pip install --upgrade pip wheel setuptools
+    ```
+
+    Naming the venv `toxicwind` is convention, not requirement. The estate does not check `sys.prefix`.
+  </Step>
+  <Step title="Export the environment contract">
+    ```bash
+    export NVIDIA_API_KEY=nvapi-...
+    export NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+    export GITHUB_TOKEN=ghp_...
+    # Optional but load-bearing for sovereign_helper.py:
+    export KIMI_PROJECT_PORTAL_CAPABILITY_ENV=dev
+    ```
+
+    `python-dotenv` will read a `.env` if the working directory has one; exports survive the shell session.
+  </Step>
+</Steps>
+
+## Ritual 1: additional-lens-profiles
+
+<Steps>
+  <Step title="Clone and enter">
+    ```bash
+    git clone https://github.com/toxicwind/additional-lens-profiles.git
+    cd additional-lens-profiles
+    ```
+  </Step>
+  <Step title="Provision the .env">
+    ```bash
+    cp .env.example .env
+    # Fix the leading space defect on the LENS_API_KEY line:
+    sed -i 's/^LENS_API_KEY= /LENS_API_KEY=/' .env
+    $EDITOR .env
+    ```
+
+    The `sed` is not paranoia. The example file ships with `LENS_API_KEY= lens_...`; the space becomes part of the value when `os.environ.get()` reads it later. `python-dotenv` handles this correctly; a bare `export $(cat .env)` does not.
+  </Step>
+  <Step title="Install requirements with CDN fallback">
+    ```bash
+    pip install -r requirements.txt \
+      || pip install -i https://mirrors.aliyun.com/pypi/simple -r requirements.txt \
+      || pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+    ```
+
+    This mirrors `sovereign_helper.pip_with_fallback()` at the shell level. The `pyppeteer` install triggers a 170MB Chromium download on first use, not first install.
+  </Step>
+  <Step title="Compile-check every module (matches CI)">
+    ```bash
+    python -m py_compile src/nvidia_swarm/*.py
+    python -m py_compile src/iptv_discovery/*.py
+    python -m py_compile src/benchmarks/*.py
+    ```
+
+    If a syntax error surfaces, you are on Python 3.10 and lost. Go back to Ritual 0.
+  </Step>
+  <Step title="Invoke the swarm dry-run">
+    ```bash
+    python -m src.nvidia_swarm.swarm_main --task "groq-deprecation-osint"
+    ```
+
+    Expected: agents dispatch, DAG runs, `AgentResult` JSON prints to stdout. If NIM returns 401, the API key is wrong. If it returns 429, the concurrency profile is too high; edit `LENS_PROFILES["bleeding"].concurrency` down to 32.
+  </Step>
+</Steps>
+
+## Ritual 2: python-sdk-auditor
+
+Stdlib-only. No `.env`. No install step needed beyond cloning.
+
+<Steps>
+  <Step title="Clone">
+    ```bash
+    git clone https://github.com/toxicwind/python-sdk-auditor.git
+    cd python-sdk-auditor
+    ```
+  </Step>
+  <Step title="Audit a local package tree">
+    ```bash
+    python auditor/audit_engine.py ./my-package ./reports
+    ```
+
+    Outputs `reports/API_AUDIT.md`, `reports/api_map.json`, and one `reports/SRC_*.txt` per source file. No network.
+  </Step>
+  <Step title="Audit a PyPI package with crash isolation">
+    ```bash
+    python run_audit.py ./work requests httpx aiohttp
+    ```
+
+    `run_audit.py` shells out to `fetch_pkgs.py` inside a subprocess. If a `setup.py` in a downloaded sdist raises, the parent survives. Verify `./work/pkgs/` contains extracted wheels and `./work/reports/` contains the audit output.
+  </Step>
+  <Step title="Audit against an internal mirror">
+    ```bash
+    python run_audit.py ./work flask --index https://your-mirror/simple
+    ```
+
+    The `--index` flag is passed through to `pip download --index-url`. Corporate mirrors that require auth need `~/.pip/pip.conf` configured; the script does not accept credentials on the command line.
+  </Step>
+</Steps>
+
+## Ritual 3: awesome-api-shape-explorer
+
+<Steps>
+  <Step title="Install as editable">
+    ```bash
+    git clone https://github.com/toxicwind/awesome-api-shape-explorer.git
+    cd awesome-api-shape-explorer
+    pip install -e .
+    ```
+
+    The `pyproject.toml` declares an entry point `awesome-api-shape-explorer` bound to `awesome_api_shape_explorer.cli:main`, but the actual module is `src/api_shape_explorer.py`. The console script fails on a fresh install unless you use the CLI form below.
+  </Step>
+  <Step title="Emit JSON for a source tree">
+    ```bash
+    python src/cli.py ./src -f json -o api-report.json
+    ```
+  </Step>
+  <Step title="Emit Markdown">
+    ```bash
+    python src/cli.py ./src -f markdown -o API.md
+    ```
+
+    The Markdown output truncates docstrings at 100 characters. This is hard-coded in `_markdown_report()` and unconfigurable.
+  </Step>
+</Steps>
+
+## Ritual 4: sovereign-scripts
+
+<Steps>
+  <Step title="Clone into a helpers directory">
+    ```bash
+    git clone https://github.com/toxicwind/sovereign-scripts.git ~/sovereign-scripts
+    ```
+  </Step>
+  <Step title="Register the helper on PATH">
+    ```bash
+    echo 'export PATH="$HOME/sovereign-scripts:$PATH"' >> ~/.bashrc
+    source ~/.bashrc
+    ```
+  </Step>
+  <Step title="Verify GitHub API access">
+    ```bash
+    python -c "
+    import asyncio
+    from sovereign_helper import GitHubClient
+    async def main():
+        async with GitHubClient() as c:
+            repos = await c.get_repos()
+            print(f'{len(repos)} repos, rate limit remaining: {c._session.headers}')
+    asyncio.run(main())
+    "
+    ```
+
+    Requires `GITHUB_TOKEN`. Prints the count of repos owned by the token holder.
+  </Step>
+  <Step title="Run the MITM proxy (advanced)">
+    ```bash
+    python mitm-proxy/playwright_mitm.py
+    ```
+
+    Launches a Playwright browser through a local proxy. Requires `playwright install chromium` first. Not needed for the swarm; only for `swarm_mitm_proxy.py` upstream.
+  </Step>
+</Steps>
+
+## Ritual 5: youtube-403-bypass
+
+The only single-command bootstrap in the estate:
+
+<Steps>
+  <Step title="Fire the installer">
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/toxicwind/youtube-403-bypass/main/install.sh | bash
+    ```
+
+    Detects browser profiles, installs Deno if missing, writes a wrapper to `~/.local/bin/yt-dlp`, and edits `~/.zshrc` or `~/.bashrc` to prepend `~/.local/bin` to PATH.
+  </Step>
+  <Step title="Reload shell and verify">
+    ```bash
+    source ~/.zshrc  # or ~/.bashrc
+    which yt-dlp     # must print ~/.local/bin/yt-dlp
+    ```
+  </Step>
+  <Step title="Download a video">
+    ```bash
+    yt-dlp 'https://youtu.be/VIDEO_ID'
+    ```
+
+    Cookies are extracted from the auto-detected browser. A `Extracted N cookies from chrome` line precedes the actual download. If N is 0, close all Chrome windows first; Chrome locks its cookie DB while running.
+  </Step>
+</Steps>
+
+## The Ritual Interdependency Graph
+
+<CodeGroup>
+
+```text Which script depends on which
+sovereign-scripts (sovereign_helper.py)
+   │
+   ├── ensure_imports() called by ──▶ additional-lens-profiles/scripts/setup.sh
+   ├── pip_with_fallback() used by ──▶ CI benchmark runs
+   └── GitHubClient used by ──────────▶ any repo-batch operation
+
+python-sdk-auditor
+   │
+   └── api_map.json ─── consumed by ──▶ awesome-api-shape-explorer visualization
+                                        (informal contract, undocumented)
+
+youtube-403-bypass
+   │
+   └── independent; no other repo imports it
+```
+
+</CodeGroup>
+
+<Warning>
+  None of these rituals are idempotent. A second run of `install.sh` will happily re-append the PATH export to `~/.zshrc`, resulting in duplicate lines. Guard with `grep -q 'toxicwind' ~/.zshrc || echo 'export ...' >> ~/.zshrc` if you are re-running.
+</Warning>
+
+Cross-references: [hardware pre-requisites](/setup/hardware-and-runtime) · [isolation](/setup/isolation-and-sandboxing) · [CI workflow map](/pipelines/workflow-engine-map).

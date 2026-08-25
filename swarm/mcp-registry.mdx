@@ -1,0 +1,164 @@
+---
+title: "MCP Registry: Remote Servers the Swarm Actually Talks To"
+sidebarTitle: "MCP Registry"
+description: "Remote MCP endpoint registry used by the swarm. Lists hosted transports, auth patterns, rate limits, and unlock env vars so agents run without local npx overhead."
+---
+
+The estate avoids local `npx` MCP servers because every additional process is a scheduling and sandboxing burden the Lens profiles do not budget for. Instead, the swarm keeps a single JSON registry at `swarm/servers.json` that points to hosted, remote, or self-hosted endpoints. Most entries are keyless. The ones that require keys use placeholder tokens in a committed `.env.example`, never in the working env. This page is the canonical roster: every URL, transport, and auth header is copy/paste ready into your MCP client descriptor.
+
+## The registry file
+
+The following `<CodeGroup>` shows the complete `swarm/servers.json` object. Each entry maps a short codename to a transport descriptor. Transports are `streamable-http`, `http+sse`, or `local` (stdio). Where auth is required, the header value is an interpolation token. Where none is required, the field is omitted.
+
+```json swarm/servers.json
+{
+  "mcpServers": {
+    "context7": {
+      "url": "https://mcp.context7.com/mcp",
+      "transport": "streamable-http",
+      "headers": {
+        "Authorization": "Bearer ${CONTEXT7_API_KEY}"
+      }
+    },
+    "deepwiki": {
+      "url": "https://mcp.deepwiki.com/mcp",
+      "transport": "streamable-http"
+    },
+    "coingecko": {
+      "primary": "https://mcp.api.coingecko.com/mcp",
+      "sse_fallback": "https://mcp.api.coingecko.com/sse",
+      "transport": "streamable-http"
+    },
+    "hatchloop_enrich": {
+      "url": "https://hatchloop.dev/mcp/data-enrichment",
+      "transport": "streamable-http"
+    },
+    "hatchloop_pdf": {
+      "url": "https://hatchloop.dev/mcp/pdf-generator/mcp",
+      "transport": "streamable-http"
+    },
+    "hatchloop_url": {
+      "url": "https://hatchloop.dev/mcp/url-shortener/mcp",
+      "transport": "streamable-http"
+    },
+    "keenable": {
+      "url": "https://api.keenable.ai/mcp",
+      "transport": "streamable-http",
+      "rate_limit": {
+        "requests_per_hour": 1000
+      }
+    },
+    "github_copilot": {
+      "url": "https://api.githubcopilot.com/mcp/",
+      "transport": "streamable-http",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_TOKEN}"
+      }
+    },
+    "exa_search": {
+      "url": "https://api.exa.ai/search",
+      "transport": "http+sse",
+      "headers": {
+        "x-api-key": "${EXA_API_KEY}"
+      },
+      "params": {
+        "stream": true
+      }
+    },
+    "fetcher_mcp": {
+      "url": "${FETCHER_MCP_URL}",
+      "transport": "streamable-http"
+    },
+    "mcp_behave": {
+      "transport": "local",
+      "cmd": "mcp-behave",
+      "note": "stdio only; strace capture requires a local child process"
+    },
+    "mintlify": {
+      "url": "https://mcp.mintlify.com",
+      "transport": "streamable-http",
+      "auth": "oauth"
+    },
+    "mintlify_docs": {
+      "url": "https://www.mintlify.com/docs/mcp",
+      "transport": "streamable-http"
+    }
+  }
+}
+```
+
+## Environment placeholders and unlock flags
+
+The `.env.example` below lists every interpolated token referenced in `servers.json`, plus the NVIDIA key used by the [Lens profile broker](/swarm/argv-lens-picker). All values are placeholder strings. Replace them with real secrets in a local `.env` that is ignored by version control.
+
+<Warning>
+  The swarm treats request headers as write-only. A `_redact_headers()` shim scrubs `Authorization` and `x-api-key` from logs and trace buffers before they hit disk or telemetry. Never commit a `.env` with real values. CI only sees the sample file below and fails fast if a required key is still set to `REPLACE_ME`.
+</Warning>
+
+```bash .env.example
+# MCP API keys (never commit real values)
+CONTEXT7_API_KEY=ctx7sk-REPLACE_ME
+EXA_API_KEY=REPLACE_ME_UUID_FORMAT
+GITHUB_TOKEN=ghp_REPLACE_ME
+FETCHER_MCP_URL=http://127.0.0.1:8931/mcp
+
+# NVIDIA NIM gateway key used by Lens broker
+NVIDIA_API_KEY=nvapi-REPLACE_ME
+
+# Unlock flags that let the daemon proceed without interactive prompts
+YOLO=1
+ALWAYS_ACCEPT_AND_CONTINUE=1
+MCP_APPROVAL_MODE=auto
+```
+
+The unlock flags are not secrets. They are behavioral overrides that bypass per-request approval prompts. When `MCP_APPROVAL_MODE` is `auto`, the swarm evaluates tool safety heuristics internally and forwards the call without blocking on operator input. `YOLO` and `ALWAYS_ACCEPT_AND_CONTINUE` are equivalent synonyms respected by downstream MCP client wrappers. If you run the daemon in headless or CI mode, at least one of these must be set or the orchestrator will deadlock waiting for a TTY that does not exist.
+
+## Transport selection rules
+
+<Accordion title="When the swarm picks streamable-http vs SSE vs stdio">
+  - **streamable-http** is the default for every hosted endpoint. The MCP specification has deprecated raw SSE (`/sse`) in favor of streamable-http because the latter reuses a single HTTP connection for bidirectional JSON-RPC traffic rather than splitting control and data into separate streams. The swarm prefers streamable-http for all new entries.
+  - **http\+sse** is retained only for endpoints that expose SSE as a first-class feature (e.g., Exa search with `stream: true`). In these cases, the client opens an SSE channel for response fragments while the request is still a plain POST. This is not the legacy MCP `/sse` transport; it is application-level streaming inside a normal HTTP call.
+  - **stdio / local** is restricted to tools that must inspect the local process tree. `mcp_behave` is the only registry entry that uses stdio, because its purpose is `strace`-based behavioral auditing of a child process. A remote server cannot `strace` your PID namespace. If you do not need local syscall tracing, do not use local transports; they add spawn cost and shell-quoting risk that the Lens profiles do not account for.
+  - **SSE fallback entries** exist in the registry (for example, CoinGecko's `/sse` path) but the swarm always tries the streamable-http primary first. The fallback is exercised only when the primary returns `405 Method Not Allowed` or a connection reset during the initial handshake. This saves you from editing JSON during a transient outage.
+</Accordion>
+
+## Notes on specific endpoints
+
+### CoinGecko: 76\+ tools, zero auth
+
+The CoinGecko endpoint is the most tool-dense entry in the registry. It requires no API key and exposes price, market, exchange, and category lookups. Because it is ungated, the swarm routes CoinGecko calls through the `cognitive` lens profile (concurrency 32, http2-persistent) rather than `architectural` to avoid burning high-concurrency slots on cheap queries.
+
+### Context7: keyed, deprecated SSE
+
+Context7 advertises `/mcp` as streamable-http and `/sse` as a legacy path. The registry only defines the streamable-http URL. If your MCP client library defaults to SSE discovery, override it explicitly or the daemon will log a deprecation warning. The `CONTEXT7_API_KEY` is a standard bearer token; rotate it through the provider dashboard.
+
+### Keenable: anonymous, rate-limited
+
+Keenable is completely anonymous but caps requests at 1000 per hour. The swarm tracks this in a simple in-memory token bucket inside the `LensSwarmOrchestrator`. If you exhaust the hourly budget, the orchestrator marks the endpoint `degraded` and retries with exponential backoff rather than failing the whole DAG plan.
+
+### GitHub Copilot MCP: PAT required
+
+This endpoint is the only one in the registry that demands a GitHub personal access token. The PAT must include `copilot` scope. Because the token is long-lived and high-privilege, the swarm redacts it aggressively: the `_redact_headers()` shim replaces the full header value with `Bearer <redacted>` in every log line, trace span, and `ArchiveFS` metadata entry.
+
+### Exa search: streaming results
+
+Exa supports `stream: true` as a request parameter, returning `text/event-stream` fragments. The swarm consumes these fragments incrementally so that a long research query does not block the DAG plan while waiting for the final JSON array. The `x-api-key` header is redacted identically to bearer tokens.
+
+### fetcher-mcp: self-hosted
+
+The fetcher endpoint (jae-jae, Playwright-based) is not a public URL. The registry interpolates `${FETCHER_MCP_URL}` so that each estate operator points it at their own instance. Typical local deployment is `http://127.0.0.1:8931/mcp`, but production clusters often run it on an internal bridge. Because the variable is unconstrained, the swarm validates the resolved URL against an allow-list regex before opening the connection.
+
+### mcp-behave: local stdio only
+
+`mcp-behave` is a pip-installable package. It runs as a local stdio server and forks the target process under `strace`. There is no remote equivalent; behavioral syscall auditing requires kernel-level access to the local task. If you are running the swarm inside a container, `mcp-behave` needs `CAP_SYS_PTRACE` or an equivalent seccomp relaxation. The registry entry notes this explicitly so operators do not attempt to host it behind an HTTP bridge.
+
+### Mintlify: OAuth
+
+The primary Mintlify MCP uses OAuth rather than a static token. The swarm delegates the OAuth flow to the same browser-guard subprocess used by `sovereign-scripts` (see `patches/browser_guard.py`). The docs variant (`mintlify_docs`) is unauthenticated and provides read-only access to the Mintlify documentation corpus. For most automated publishing tasks, you only need the docs endpoint. Reserve the OAuth endpoint for admin-level operations.
+
+## Related pages
+
+- [Zero-Magic Bootstrap](/setup/zero-magic-bootstrapping)
+- [Lens Profile Picker](/swarm/argv-lens-picker)
+- [Daemon Hot Reload](/swarm/daemon-hot-reload)
+- [API Interface Schema](/api/interface-schema)

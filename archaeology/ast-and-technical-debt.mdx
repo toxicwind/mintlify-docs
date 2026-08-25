@@ -1,0 +1,178 @@
+---
+title: "AST Parsing, Grammar Constraints, and the Technical Debt Strata"
+sidebarTitle: "AST & Technical Debt"
+description: "Core modules and parsing engines: ast.walk, tokenize fallback, BNF/regex grammar constraints, and the structural workarounds papering over upstream faults."
+---
+
+Three modules in the toxicwind estate handle structured parsing: `python-sdk-auditor/auditor/audit_engine.py` (audit AST), `awesome-api-shape-explorer/src/api_shape_explorer.py` (introspection AST), and `swarm_maximal.py::GrammarConstraint` (LLM output grammar). Each solves a different problem and each carries a specific concession to the entropy of its input format.
+
+## The Audit AST: Regex Fallback as Confession
+
+`audit_engine.audit_file()` parses with `ast.parse()`, and when that fails, it does not retry. It writes a flag record and continues on empty:
+
+```python audit_engine.py highlight={8-11}
+try:
+    tree = ast.parse(src)
+except SyntaxError as e:
+    out["flags"].append({
+        "pattern": "AST_PARSE_FAIL",
+        "count": 1,
+        "samples": [f"{e.msg} (line {e.lineno}) — likely py2 or invalid; regex audit only"]
+    })
+    tree = ast.Module(body=[], type_ignores=[])
+```
+
+The empty `ast.Module` is not defensive programming. It is a deliberate confession that any package containing Python 2 syntax will be audited by the ten regex flag patterns only:
+
+<CodeGroup>
+
+```python audit_engine.py regex flags
+pats = {
+    "base64_blob": r"[A-Za-z0-9+/]{200,}={0,2}",
+    "hex_blob": r"\b[0-9a-fA-F]{128,}\b",
+    "exec_eval": r"\b(exec|eval)\s*\(",
+    "marshal_zlib": r"\b(marshal|zlib|bz2|lzma)\b",
+    "unicode_escape": r"\\u[0-9a-fA-F]{4}",
+    "chinese_text": r"[一-鿿]+",
+    "url": r"https?://[^\s'\"]+",
+    "ip_addr": r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",
+    "todo_fixme": r"(TODO|FIXME|XXX|HACK|WARN|DEPRECATED)",
+    "token_key": r"(token|apikey|api_key|secret|password|bearer)",
+}
+```
+
+</CodeGroup>
+
+This is not principled static analysis. It is grep with a JSON schema wrapper. It works because malicious packages do not go to the trouble of splitting `exec(` across a line boundary; when they do, the auditor misses them and this is a known limitation, not a bug. The `chinese_text` pattern is telling: it exists because supply-chain attacks against `python-<lib>-mirror` typosquats routinely embed Mandarin comments as low-effort obfuscation of C2 URLs.
+
+<Note>
+  `ast.walk()` is used for class and import discovery; `tokenize.generate_tokens()` is used for comment harvest because AST drops comments during parsing (Python spec, not a bug). When `tokenize` raises `TokenError` or `IndentationError` on malformed sources, a regex `#[^\n]*` fallback runs. This is a two-stage fallback for a two-stage failure surface.
+</Note>
+
+## The Shape Explorer: `ast.unparse` with a 3.8 Ghost
+
+`awesome-api-shape-explorer` is functionally a subset of the auditor with one additional twist: it reconstructs signatures using `ast.unparse()`, which does not exist on Python 3.8. The workaround is a manual visitor covering exactly the six AST node types that actually appear in signatures:
+
+```python api_shape_explorer.py highlight={5,7-19} lines
+def _unparse(self, node):
+    if node is None:
+        return ""
+    if PY_VER >= (3, 9):
+        return ast.unparse(node)
+    # Fallback for 3.8
+    if isinstance(node, ast.Name):
+        return node.id
+    elif isinstance(node, ast.Constant):
+        return repr(node.value)
+    elif isinstance(node, ast.Attribute):
+        return f"{self._unparse(node.value)}.{node.attr}"
+    elif isinstance(node, ast.Subscript):
+        return f"{self._unparse(node.value)}[{self._unparse(node.slice)}]"
+    elif isinstance(node, ast.List):
+        return f"[{', '.join(self._unparse(e) for e in node.elts)}]"
+    elif isinstance(node, ast.Tuple):
+        return f"({', '.join(self._unparse(e) for e in node.elts)})"
+    elif isinstance(node, ast.Call):
+        args = [self._unparse(a) for a in node.args]
+        kwargs = [f"{k.arg}={self._unparse(k.value)}" for k in node.keywords]
+        return f"{self._unparse(node.func)}({', '.join(args + kwargs)})"
+    return "..."
+```
+
+The `return "..."` at the bottom is the entire cynicism of this codebase in three characters. If the AST node is something exotic (a `Starred`, a `Slice`, a `NamedExpr`, an `IfExp`), the signature contains the literal string `...` and the report is a lie by omission. This is fine because the target audience is a human reading the Markdown report, not a downstream compiler.
+
+### Cyclomatic Complexity, McCabe 1976, Applied Wrong
+
+The complexity calculation is deliberately naive:
+
+```python api_shape_explorer.py
+complexity = 1 + sum(1 for n in ast.walk(node) if isinstance(n, (
+    ast.If, ast.While, ast.For, ast.ExceptHandler,
+    ast.With, ast.Assert, ast.comprehension
+)))
+```
+
+Real McCabe complexity counts decision points in the control-flow graph, weights `elif` chains correctly, and does not double-count `with` statements. This implementation:
+
+1. Counts every `with` as \+1, which is not a decision point.
+2. Counts every list/dict/set comprehension's `for` clauses as \+1, which conflates iteration with branching.
+3. Ignores boolean short-circuit (`and`/`or`) which McCabe originally included.
+
+The result is a complexity metric that correlates with the real one but is not it. The author almost certainly knows this. Nobody uses cyclomatic complexity as a hard threshold in 2026; it is a heat map for refactor triage, and this metric is good enough for that purpose.
+
+## The LLM Grammar Constraint: BNF as Wishful Thinking
+
+The `swarm_maximal.py` artifact contains a `GrammarConstraint` class that claims to enforce BNF/regex modes but in practice does regex only:
+
+<CodeGroup>
+
+```python swarm_maximal.py GrammarConstraint
+class GrammarConstraint:
+    def __init__(self, allowed_tools=None, mode="bnf"):
+        self.allowed_tools = allowed_tools or []
+        self.mode = mode
+        self._tool_pattern = re.compile(
+            r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
+            re.DOTALL
+        )
+
+    def extract_tool_calls(self, text):
+        calls = []
+        for match in self._tool_pattern.finditer(text):
+            raw_json = match.group(1)
+            try:
+                data = json.loads(raw_json)
+                if "name" in data and (not self.allowed_tools or data["name"] in self.allowed_tools):
+                    calls.append(data)
+            except Exception:
+                continue
+        return calls
+```
+
+</CodeGroup>
+
+The `mode` field is inspected by nothing in the codepath. Whether a `LensProfile` declares `grammar_mode="bnf"` or `grammar_mode="regex"`, the extractor runs the same `<tool_call>...</tool_call>` regex against the model's raw output. This is the standard trick: real grammar-constrained decoding requires either (a) `llama.cpp`'s GBNF hooks on the server side, or (b) NVIDIA NIM's `guided_json` parameter, and neither is being emitted by the transport layer.
+
+<Warning>
+  The `grammar_valid` flag on `Result` returns `True` whenever the response contains no `<tool_call>` tag or contains at least one parseable one. A response with a malformed `<tool_call>{"name":` (missing closing brace) simply produces zero tool calls and `grammar_valid=True`. The name of the field promises more than the implementation delivers.
+</Warning>
+
+## The Llama 3.1 Chat Template: Reimplementing the Tokenizer's Job
+
+`Llama31ChatTemplate.format_messages()` hand-rolls the exact template the tokenizer would apply if `tokenizer.apply_chat_template()` were called:
+
+```python swarm_maximal.py
+SPECIAL_TOKENS = {
+    "header_start": "<|start_header_id|>",
+    "header_end": "<|end_header_id|>",
+    "eot": "<|eot_id|>",
+    "eom": "<|eom_id|>",
+    "python_tag": "<|python_tag|>",
+}
+```
+
+Why hand-roll? Because the transport layer (`TritonGrpcTransport`) sends raw prompt bytes to the model's `text_input` tensor, bypassing any tokenizer that lives server-side. The prompt must arrive already formatted. This is the correct choice for Triton's `ensemble` model layout where the tokenizer is a separate model and the client controls which templates apply. It is also brittle: Llama 3.2 introduced `<|image|>` tokens; Llama 3.3 changed nothing but future Llama 4 headers will not match, and this file will silently produce wrong prompts.
+
+## The Debt Strata, Ranked
+
+<Accordion title="1. Empty AST modules on parse failure (auditor)">
+  Known and documented. The regex flag pass is the safety net. Grade: acceptable compromise.
+</Accordion>
+
+<Accordion title="2. `ast.unparse` fallback returns literal '...' (shape explorer)">
+  Silent lie in the report. Grade: bad, but bounded to Python 3.8 users who mostly don't exist anymore.
+</Accordion>
+
+<Accordion title="3. Naive cyclomatic complexity (shape explorer)">
+  Correlates with truth. Grade: acceptable for a heat map, misleading if used as a gate.
+</Accordion>
+
+<Accordion title="4. Grammar mode field is not consulted (swarm)">
+  Cargo-cult BNF branding on a regex extractor. Grade: technical debt shipped as marketing.
+</Accordion>
+
+<Accordion title="5. Hand-rolled Llama 3.1 chat template (swarm)">
+  Correct today, wrong at the next model bump. Grade: predictable maintenance burden.
+</Accordion>
+
+Cross-references: [swarm interface schema](/api/interface-schema) · [dependency lifecycle](/archaeology/state-and-dependency-lifecycle) · [swarm maximal repo](/repos/additional-lens-profiles).

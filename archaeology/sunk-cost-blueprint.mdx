@@ -1,0 +1,117 @@
+---
+title: "The Sunk Cost Blueprint: Data Flow Across the toxicwind Estate"
+sidebarTitle: "Sunk Cost Blueprint"
+description: "Layered data flow from invocation to terminal execution across additional-lens-profiles, python-sdk-auditor, and sovereign-scripts, with a critique of the chosen abstractions."
+---
+
+The `toxicwind` estate has no unified architecture. It has three overlapping data-flow topologies, each optimized for a different failure mode of the underlying ecosystem: LLM provider fragility (`additional-lens-profiles`), Python supply-chain opacity (`python-sdk-auditor`, `awesome-api-shape-explorer`), and GitHub-API rate-limit tyranny (`sovereign-scripts`). None of these topologies were chosen from a menu of academic alternatives; each is a scar tissue response to a specific upstream betrayal.
+
+## Topology 1: The Swarm DAG (LLM Path)
+
+The canonical execution path in [`additional-lens-profiles`](/repos/additional-lens-profiles) is a topologically ordered DAG of async coroutines dispatched through a shared `aiohttp.TCPConnector`. This is not novel. It is the same shape as OpenAI's `swarm.run()`, `LangGraph`, `Haystack`, and every other agent orchestrator shipped since 2023, minus the marketing surface.
+
+<CodeGroup>
+
+```text Invocation Path
+python -m src.nvidia_swarm.swarm_main --task "groq-deprecation-osint"
+    │
+    ├─▶ swarm_main.py                  # arg parsing, .env load via python-dotenv
+    ├─▶ NvidiaSwarmDAG.__aenter__      # allocates TCPConnector(limit=32)
+    ├─▶ register_agent(researcher|analyst|coder|orchestrator)
+    ├─▶ run_dag(dag=[DAGNode, ...])    # topological ready-set expansion
+    │       ├─▶ asyncio.gather(execute_node × ready)
+    │       └─▶ per-node: semaphore(16) → agent.arun() → AgentResult
+    └─▶ get_throughput_stats()         # aggregate latency, tok/s, parallel efficiency
+```
+
+```text Dependency Merge Semantics
+DAGNode(
+  agent_name="analyst",
+  dependencies=["researcher"],
+  inputs={"query": "..."},
+)
+    │
+    ▼
+merged_input = {**node.inputs, "researcher_output": results["researcher"].output}
+```
+
+</CodeGroup>
+
+The cynical reading: the entire DAG engine is 145 lines (`src/nvidia_swarm/nvidia_swarm_core.py`). It is functionally a `while pending: gather(ready)` loop with a `Semaphore(16)` throttle. Compare this to `LangGraph`'s `StateGraph` with typed reducers and durable checkpointing, or to Ray's actor-based DAG scheduler. The toxicwind version is chosen because those alternatives require you to trust a dependency that will break on the next minor bump. A 145-line file will not.
+
+<Accordion title="Why not use LangGraph, CrewAI, or Ray?">
+  LangGraph as of Oct 2025 requires `langchain-core>=0.3`, which requires `pydantic>=2.7`, which is not ABI-compatible with several NVIDIA-NIM SDK pins. CrewAI's `@agent` decorator hides the exact HTTP payload sent to the model, which defeats the point of running against NIM's HTTP/2 endpoint. Ray adds a 40MB baseline and a gRPC control plane for what is effectively a fanout of six HTTP requests. The 145-line file is not laziness; it is a rejection of Chesterton's Fence sold as ergonomics.
+</Accordion>
+
+## Topology 2: The AST Sink (Auditor Path)
+
+[`python-sdk-auditor`](/repos/python-sdk-auditor) and [`awesome-api-shape-explorer`](/repos/awesome-api-shape-explorer) share a topology: `os.walk → open → ast.parse → ast.walk → JSON/Markdown sink`. Zero runtime execution. Zero third-party imports. This is the correct academic answer (see: Rice 1953, Landi & Ryder 1992 on static analysis limits) applied with the specific concession that Python 2 corpses still exist in the wild.
+
+```text Auditor Data Flow
+targets.txt ──▶ run_audit.py ──▶ subprocess(fetch_pkgs.py)  # crash isolation
+                    │                    │
+                    │                    ▼
+                    │              pip download --no-deps
+                    │                    │
+                    │                    ▼
+                    └─▶ audit_engine.audit_file(path)
+                           │
+                           ├─▶ ast.parse(src)       [primary]
+                           │      │
+                           │      ├─▶ SyntaxError? ─▶ regex fallback path
+                           │      │                    (marked AST_PARSE_FAIL)
+                           │      └─▶ ast.walk → Import|ClassDef|FunctionDef
+                           │
+                           ├─▶ tokenize.generate_tokens  [comment harvest]
+                           │      │
+                           │      └─▶ TokenError? ─▶ regex #[^\n]* fallback
+                           │
+                           └─▶ 10 regex flag patterns
+                                  (base64_blob, exec_eval, marshal_zlib,
+                                   unicode_escape, chinese_text, url,
+                                   ip_addr, todo_fixme, token_key, hex_blob)
+```
+
+The subprocess isolation in `run_audit.py` exists because `pip download` will happily execute setup.py on legacy sdists. If a malicious package poisons the working directory, the crash stays inside the child. This is the only defensible architectural choice in the entire estate. Everything else is compromise; this is engineering.
+
+## Topology 3: The Rate-Limit Autopilot (Sovereign Path)
+
+[`sovereign-scripts`](/repos/sovereign-scripts) exists because `github.com/user/repos?page=N` throws 403 after 5000 requests/hour on a PAT and there is no first-class Python client that respects the reset headers without importing 200MB of `PyGithub` transitive dependencies.
+
+```text GitHub Batch Path
+GitHubClient(token=$GITHUB_TOKEN).__aenter__
+    │
+    ▼
+request(method, url) ─▶ RateLimit.acquire(cost=1)
+                              │
+                              ├─▶ remaining < cost?
+                              │      ├─▶ yes: sleep(reset_at - now + 1)
+                              │      └─▶ no: decrement
+                              │
+                              ▼
+                        aiohttp.request()
+                              │
+                              ▼
+                        parse X-RateLimit-* headers
+                              │
+                              ▼
+                        json.loads(body)  |  {"_raw": text}
+```
+
+The `RateLimit` dataclass uses an `asyncio.Lock` to serialize header updates. This is correct. Every published GitHub-API wrapper this author has surveyed either (a) polls the `/rate_limit` endpoint (wasted request), or (b) ignores the headers and eats 403s (wasted time). The toxicwind approach eats the header on every response and pre-empts. This is the Chesterton's Fence that most other libraries knocked down without asking why.
+
+## Cross-Topology Bridges
+
+<Accordion title="Where the three topologies leak into each other">
+  - `sovereign_helper.py::ensure_imports()` is called by `additional-lens-profiles/scripts/setup.sh` to auto-install missing wheels via `pip_with_fallback()` against three PyPI mirrors (pypi.org, aliyun, tsinghua). This is a CDN failover masquerading as a dependency manager. It ships wheels through the tsinghua mirror when pypi.org is throttled from certain BGP regions.
+  - `python-sdk-auditor`'s `api_map.json` output is the input format expected by `awesome-api-shape-explorer`'s `_shape_to_dict`. They were built to interoperate; nothing in either README says so.
+  - The `additional-lens-profiles/data/aug2026/iptv_stremio_aug2026.jsonl` file (216KB) is the output of a swarm run that was checked in. This is anti-pattern by every published guideline. It is also the fastest way to reproduce a case study without re-burning \$200 of NVIDIA credits.
+</Accordion>
+
+## What This Estate Refuses to Do
+
+<Note>
+  No repository uses `pydantic` for I/O. No repository uses `poetry`. No repository ships a Docker image with a pinned base tag. All three of these are non-choices, and each non-choice extends the code's expected half-life at the cost of onboarding a new contributor. This is a knowingly hostile tradeoff.
+</Note>
+
+Cross-references: [AST parsing internals](/archaeology/ast-and-technical-debt) · [dependency lifecycle](/archaeology/state-and-dependency-lifecycle) · [swarm interface schema](/api/interface-schema).

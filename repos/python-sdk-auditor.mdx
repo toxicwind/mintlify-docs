@@ -1,0 +1,108 @@
+---
+title: "python-sdk-auditor: Stdlib-only Static Analysis for PyPI Packages"
+sidebarTitle: "python-sdk-auditor"
+description: "A stdlib-only PyPI package auditor using AST parsing and regex heuristics. Runs offline in subprocess isolation to flag suspicious patterns without external APIs or SaaS dependencies."
+---
+
+`python-sdk-auditor` is a solo-authored static analysis tool for PyPI packages that refuses every dependency except the Python standard library. It downloads packages, parses their source with `ast`, harvests comments with `tokenize`, and runs ten regex heuristics over the text to flag suspicious patterns. There is no CVE database, no version metadata lookup, no typosquat distance check, and no SaaS API to phone home to. What you get is a deliberately minimal, offline-capable audit engine that trades comprehensiveness for the guarantee that it will still work when your air-gapped build machine has no outbound routes.
+
+<CardGroup cols={3}>
+  <Card title="Direct engine" href="#direct-engine-usage">
+    Import `auditor/audit_engine.py` and run analysis on local source trees. Full control, zero orchestration.
+  </Card>
+
+  <Card title="Batch orchestrator" href="#batch-orchestrator">
+    Use `run_audit.py` to fetch and audit named packages from PyPI in one shot.
+  </Card>
+
+  <Card title="Mirror audit" href="#mirror-audit-mode">
+    Point `--index` at a private index or file:// mirror for offline or internal package review.
+  </Card>
+</CardGroup>
+
+## Direct engine usage
+
+The engine lives in `auditor/audit_engine.py` and exposes a straightforward API: hand it source text, receive a structured report. It uses only stdlib modules: `ast`, `tokenize`, `re`, `json`, `hashlib`, `pathlib`, `subprocess`, `sys`, and `os`.
+
+```python
+from auditor.audit_engine import AuditEngine
+
+engine = AuditEngine()
+results = engine.audit_source("suspicious_pkg", "import os; os.system('rm -rf /')")
+```
+
+The engine attempts `ast.parse(src)` first. If the file throws a `SyntaxError`, it records an `AST_PARSE_FAIL` flag, substitutes an empty `ast.Module`, and continues with regex-only coverage. This is not robust error handling; it is a confession that Python 2 files still circulate in the wild and the auditor prefers degraded signal over hard failure. The comment harvester tries `tokenize.generate_tokens` first, then falls back to `re.finditer(r'#[^\n]*', ...)` if tokenization chokes. See [The AST fallback ladder](#the-ast-fallback-ladder) for the full degradation path.
+
+## Batch orchestrator
+
+`run_audit.py` takes positional arguments for a working directory and one or more package names, plus an optional `--index` URL.
+
+```bash
+python run_audit.py ./work_dir requests flask django --index https://pypi.example.com/simple
+```
+
+It shells out to `fetch_pkgs.py` in a subprocess. The rationale is crash isolation, not security containment: `setuptools` and `setup.py` are notorious for exiting with `SystemExit`, and a per-package subprocess means 99 of 100 packages in a batch survive even when one installer script throws a tantrum. The orchestrator does not attempt to sandbox malicious code. A hostile `setup.py` can still exfiltrate data, write to disk, or spawn processes. See [Subprocess isolation, and what it does NOT protect against](#subprocess-isolation-and-what-it-does-not-protect-against) for the honest threat model.
+
+## Mirror audit mode
+
+Pass `--index` to target a private PyPI mirror, devpi instance, or flat `file://` index. The `fetch_pkgs.py` wrapper passes the URL directly to `pip download --index-url`, so any index pip understands is valid. This is the intended path for air-gapped environments or pre-production gates where you audit internal packages before they reach a production index.
+
+## The regex flag ledger
+
+The engine compiles ten regex patterns inside the per-file loop. They are not pre-compiled, which wastes cycles at scale. The patterns and their empirical signal strength are listed below. For a deeper treatment of how these flags fit into a broader vulnerability and quality pipeline, see [/pipelines/vulnerability-and-quality](/pipelines/vulnerability-and-quality).
+
+| Flag | Pattern target | Signal strength | Notes |
+| --- | --- | --- | --- |
+| `base64_blob` | Base64-encoded strings | Medium | Common in obfuscated loaders and exfil payloads |
+| `hex_blob` | Hexadecimal byte sequences | Medium | Often precedes `exec` or `eval` calls in packed malware |
+| `exec_eval` | Calls to `exec`, `eval`, `compile` | High | Direct code execution surface; noisy but rarely benign |
+| `marshal_zlib` | `marshal.loads` or `zlib.decompress` chains | High | Classic packed Python bytecode pattern |
+| `unicode_escape` | `unicode_escape` codec usage | Low-Medium | Sometimes legitimate, sometimes obfuscation |
+| `chinese_text` | Chinese characters in comments | Low | Ethnographically suspect but empirically motivated: the 2023-2024 typosquat malware corpus was heavy on Mandarin comments. Treat as weak prior, not indictment |
+| `url` | Hardcoded URLs | Low-Medium | May indicate callback domains or payload staging |
+| `ip_addr` | Hardcoded IPv4 addresses | Medium | Less common in legitimate packages; worth a look |
+| `todo_fixme` | `TODO` or `FIXME` markers | None | Not a security signal at all. A code quality metric masquerading as a flag. Included because the author apparently could not resist |
+| `token_key` | Strings matching API key or token shapes | Medium-High | High false-positive rate; manual review required |
+
+The `chinese_text` flag deserves extra scrutiny. It is not a linguistic indictment; it is a crude statistical filter derived from a specific malware corpus. Use it to prioritize manual review, not to auto-reject packages. The `todo_fixme` flag has even less justification. It measures developer guilt, not attacker behavior.
+
+## The AST fallback ladder
+
+The engine degrades gracefully through three parsing stages, each weaker than the last:
+
+1. **`ast.parse(src)`**: Full abstract syntax tree traversal. Captures imports, function definitions, and call graphs. On `SyntaxError`, the engine logs `AST_PARSE_FAIL` and falls through.
+2. **`tokenize.generate_tokens`**: Line-by-line token stream for comment and string literal extraction. Fails on severely malformed or non-UTF-8 files.
+3. **`re.finditer(r'#[^\n]*', ...)`**: Brute-force comment regex. Captures anything that looks like a comment regardless of parse validity. The regex is naive and will miss comments inside string literals, but it runs on anything that is text-shaped.
+
+This ladder is documented in [AST and technical debt](/archaeology/ast-and-technical-debt) as a case study in accepting partial signal when full parsing is impossible. The empty-`Module` trick is particularly telling: the auditor admits that Python 2 legacy files exist in the wild and chooses degraded regex-only coverage over a hard stop. This is pragmatic engineering, not elegant design.
+
+## Subprocess isolation, and what it does NOT protect against
+
+Both `run_audit.py` and `fetch_pkgs.py` use `subprocess` calls for isolation. The stated rationale in the source is containment of `SystemExit` crashes from `setuptools` and `setup.py` execution during `pip download`. This works: if one package in a hundred has a broken installer, the other ninety-nine still complete.
+
+What this does NOT do:
+
+- It does not sandbox against malicious code. A hostile `setup.py` runs with the same privileges as the parent process.
+- It does not prevent network exfiltration. The subprocess can open sockets freely.
+- It does not enforce filesystem restrictions. The subprocess can write anywhere the user can.
+- It is not a substitute for [isolation and sandboxing](/setup/isolation-and-sandboxing) at the infrastructure layer.
+
+If you need actual containment, run the auditor inside a container or VM with no network egress and a read-only root filesystem. The subprocess model is segfault containment, not threat containment. Do not mistake one for the other.
+
+## Reports produced
+
+After a run completes, three artifact types appear in the `reports/` directory:
+
+- **`reports/API_AUDIT.md`**: Human-readable markdown summary of flagged patterns per package, with severity annotations and source file references.
+- **`reports/api_map.json`**: Machine-parseable JSON containing the full audit results, including per-file flag tallies and AST parse status.
+- **`reports/SRC_<mangled>.txt`**: One text file per audited source file, preserving the exact source text that was analyzed. The mangling scheme is deterministic but not documented; use it for forensic replay, not programmatic access.
+
+There are no dashboards, no CI badges, and no webhook integrations. The output is files on disk. Integrate them into your own pipeline or read them manually.
+
+## Why this exists
+
+Real security suites (Snyk, Socket, OSV-Scanner) do more than this tool. They maintain CVE databases, version metadata graphs, typosquat distance metrics, and supply-chain provenance trackers. `python-sdk-auditor` does none of that. What it offers instead is a narrow niche: offline static analysis with zero external dependencies.
+
+The use case is specific. You are on an air-gapped build node. You have no API keys, no SaaS contracts, and no outbound HTTPS. You still need to audit PyPI packages before they enter your artifact store. This tool fits that gap. It is not a replacement for comprehensive scanners; it is a fallback for environments where comprehensive scanners cannot run.
+
+The estate's broader philosophy is visible here: solo-authored, stdlib-only, subprocess-isolated, and skeptical of external services. For the runtime and hardware context this tool assumes, see [/setup/hardware-and-runtime](/setup/hardware-and-runtime). For how it fits into the estate's workflow engine, see [/pipelines/workflow-engine-map](/pipelines/workflow-engine-map).

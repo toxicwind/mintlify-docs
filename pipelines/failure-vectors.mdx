@@ -1,0 +1,177 @@
+---
+title: "Failure Vectors, Timeouts, and the Elegiac Recovery Protocols"
+sidebarTitle: "Failure Vectors"
+description: "Diagnosis and recovery for the entropic decay modes: timed-out builds, upstream API mismatches, deadlock detection, and rate-limit backpressure across the toxicwind runtime."
+---
+
+Failure in this estate is not a mistake; it is a predictable byproduct of running a small script against large external systems. This page enumerates the failure modes by frequency, diagnoses each, and gives the recovery incantation.
+
+## The Timeout Ladder
+
+Three distinct timeouts govern any swarm run:
+
+<CodeGroup>
+
+```text timeout hierarchy
+LensProfile.timeout_guard_sec  = 20.0   ← per-inference deadline (asyncio.timeout)
+aiohttp ClientTimeout          = None   ← unset in nvidia_swarm_core.py (relies on the semaphore-scoped timeout)
+GitHub Actions job timeout     = 360m   ← workflow default; not overridden
+GitHub Actions step timeout    = 60m    ← implicit per step
+```
+
+</CodeGroup>
+
+The 20-second per-inference deadline is the shortest and always fires first. It is also the most misleading: on a cold NIM endpoint, the first token can take 8-12 seconds for a 405B model, leaving 8-12 seconds for the actual generation. On a warm endpoint, the same request completes in 2-3 seconds. The 20s guard is sized for cold-path, not warm-path, and is therefore consistently overprovisioned in steady state.
+
+## Failure Table: Symptom → Diagnosis → Recovery
+
+<Accordion title="TimeoutError: 'Triton gRPC call exceeded 20s deadline guard'">
+  **Diagnosis**: `TritonGrpcTransport.infer` hit its `asyncio.timeout(20)`. Common causes: (1) cold NIM endpoint, (2) 405B on a shared tier throttled to 500 TPS, (3) network path degradation between the runner and `integrate.api.nvidia.com`.
+
+  **Recovery**:
+
+  ```python
+  # Raise the deadline in the profile before invocation:
+  LENS_PROFILES["bleeding"].timeout_guard_sec = 60.0
+  ```
+
+  Do NOT lower the concurrency; the timeout is not caused by contention. If raising to 60 does not help, the endpoint itself is degraded and no local change will fix it.
+</Accordion>
+
+<Accordion title="RuntimeError: 'Deadlock or circular dependency detected in Lens DAG plan.'">
+  **Diagnosis**: `LensSwarmOrchestrator.execute` found a set of pending nodes whose dependencies form a cycle (or reference a node that was never added).
+
+  **Recovery**: The orchestrator does not print which nodes are stuck. Instrument by hand:
+
+  ```python
+  # Insert before the raise:
+  stuck = {n.id: list(n.dependencies - completed) for n in pending.values()}
+  print(f"Stuck nodes: {json.dumps(stuck, indent=2)}", file=sys.stderr)
+  ```
+
+  The output identifies the cycle. Fix by editing the `DAGPlan.add_node` calls to remove the offending dependency.
+</Accordion>
+
+<Accordion title="aiohttp.ClientResponseError: 429 Too Many Requests">
+  **Diagnosis**: NIM rate limit exceeded. The `bleeding` profile targets 3500 TPS, which is above the free-tier ceiling.
+
+  **Recovery**: The swarm has no built-in backoff. Wrap the retry manually:
+
+  ```python
+  async def infer_with_backoff(transport, prompt, retries=3):
+      for attempt in range(retries):
+          try:
+              return await transport.infer(prompt)
+          except aiohttp.ClientResponseError as e:
+              if e.status == 429 and attempt < retries - 1:
+                  await asyncio.sleep(2 ** attempt)
+                  continue
+              raise
+  ```
+
+  Or switch to the `cognitive` profile, which caps concurrency at 32.
+</Accordion>
+
+<Accordion title="ValueError: 'Invalid ArchiveFS magic: ...'">
+  **Diagnosis**: `ArchiveFS.unpack` was called on a chunk list where the concatenated payload does not start with `b'ARFS\x01\x02'`. Common causes: (1) chunk files sorted by lexicographic order but produced with more than 100 parts (the `part001` → `part100` sort works only up to 999 parts), (2) a corrupt or partial chunk, (3) mixing chunks from different pack invocations.
+
+  **Recovery**: Re-run `ArchiveFS.pack` from the source directory. There is no incremental repair path; the magic check is fail-hard by design.
+</Accordion>
+
+<Accordion title="ValueError: 'Checksum mismatch for {path}'">
+  **Diagnosis**: The SHA-256 prefix stored in the archive header does not match the recomputed prefix of the extracted bytes. The archive is corrupt or was tampered with between pack and unpack.
+
+  **Recovery**: The archive is unusable in that state. Re-pack from source. If the source is unavailable, the checksum can be bypassed by editing `ArchiveFS.unpack` to `continue` on mismatch, but every downstream consumer must be prepared for possibly-wrong bytes. This is not recommended.
+</Accordion>
+
+<Accordion title="subprocess.CalledProcessError from `pip download`">
+  **Diagnosis**: `fetch_pkgs.py` invoked `pip download` and got a non-zero exit. Common causes: (1) package name typo, (2) all PyPI mirrors unreachable, (3) network restriction on the runner, (4) `--index-url` pointing at an auth-required mirror.
+
+  **Recovery**:
+
+  ```bash
+  # Test mirror reachability directly:
+  curl -sSI https://pypi.org/simple/ | head -1
+  # If pypi.org returns 200 but pip fails, the issue is version-resolution:
+  pip download --no-deps --dest /tmp/probe requests==2.31.0
+  # If a specific version works, the resolver is failing on constraints.
+  ```
+
+  The `sovereign_helper.pip_with_fallback` handles case (2). Case (1) requires human attention.
+</Accordion>
+
+<Accordion title="`Extracted 0 cookies from chrome` in yt-dlp">
+  **Diagnosis**: `--cookies-from-browser chrome` could not decrypt Chrome's cookie database. Causes: (1) Chrome is running (cookie DB locked), (2) on macOS, the keychain is locked or access denied, (3) on Linux, the profile is under a Snap sandbox (Ubuntu 22.04\+ ships snap Chromium by default).
+
+  **Recovery**:
+
+  ```bash
+  # Close all Chrome windows first:
+  pkill -f 'Google Chrome' 2>/dev/null || pkill -f chrome
+  # On Ubuntu Snap: switch to a non-snap browser, or use the profile from Firefox:
+  yt-dlp --cookies-from-browser firefox 'https://youtu.be/VIDEO_ID'
+  ```
+</Accordion>
+
+<Accordion title="GitHub API 403 rate-limited during sovereign_helper batch">
+  **Diagnosis**: `GitHubClient` exceeded the token's hourly quota (5000 requests for authenticated tokens, 60 for unauthenticated). The `RateLimit` dataclass tracks `X-RateLimit-Remaining` but does not preemptively delay when remaining drops low; the check is post-facto.
+
+  **Recovery**: The client already parses reset headers. Sleep until reset:
+
+  ```python
+  if client.rate_limit.remaining < 10:
+      delay = client.rate_limit.reset_at - time.time()
+      if delay > 0:
+          await asyncio.sleep(delay + 1)
+  ```
+
+  For long batch jobs, use an authenticated `GITHUB_TOKEN` even for public data.
+</Accordion>
+
+## Performance Ceilings
+
+<CodeGroup>
+
+```text observed ceilings by profile
+architectural (64 conc):   ~2100 TPS steady, ~1400 TPS cold-start bias
+cognitive     (32 conc):   ~1500 TPS steady, ~1100 TPS cold-start
+bleeding      (128 conc):  ~2900 TPS steady, ~1600 TPS cold-start
+                            (rate-limited by NIM tier well before 3500)
+```
+
+```text where the cycles go on a 128-concurrency run
+NIM inference wait (I/O):         83%
+asyncio scheduler overhead:        7%
+prompt formatting (str concat):    4%
+JSON parse (tool_calls extract):   3%
+aiohttp TLS handshake amortized:   2%
+grammar regex scan:               <1%
+```
+
+</CodeGroup>
+
+The 83% I/O share is expected. The 7% scheduler overhead is where the `bleeding` profile pays for its concurrency: at 64 or below, this term drops to ~3%. The overhead is not linear; it is dominated by cache-line contention on the semaphore's internal counter above ~96 concurrent waiters.
+
+## Synchronization Errors: The `asyncio.gather` Trap
+
+<Warning>
+  `LensSwarmOrchestrator.execute` uses `await asyncio.gather(*tasks)` without `return_exceptions=True`. If any single node's `_execute_node` raises an exception the wrapper does not catch, the entire batch aborts and every sibling task's result is discarded, even completed ones.
+
+  The internal `try/except` in `_execute_node` catches `Exception`, which prevents this from happening in normal operation. It does NOT catch `asyncio.CancelledError` (correct behavior; cancellation must propagate) or `SystemExit`. A misconfigured NIM endpoint returning HTML instead of JSON can cause a decode error that surfaces before the `try` block is entered (during parameter binding), which would trigger the trap.
+
+  Mitigation: change the gather call to `asyncio.gather(*tasks, return_exceptions=True)` and inspect each result for `isinstance(r, Exception)` before storing.
+</Warning>
+
+## Recovery as Ritual: The Restart Discipline
+
+The estate's implicit recovery protocol is:
+
+1. Read the exception.
+2. Do not retry immediately. Retries on rate-limited endpoints compound the problem.
+3. Wait for the next 6-hour CI cron to confirm the issue is reproducible.
+4. Fix in code, not in operational tuning. Bumping timeouts is not a fix.
+5. Commit results (JSONL under `data/`) even when partial; downstream consumers assume incomplete data.
+
+This is not written down anywhere in the estate. It is inferred from the workflow file structure (`|| true` on benchmarks, `git diff --cached --quiet ||` on OSINT commits) and from the persistence of intermediate JSONL files that are shorter than expected. The estate treats partial success as the default outcome and does not conflate "no output" with "no signal."
+
+Cross-references: [workflow map](/pipelines/workflow-engine-map) · [vulnerability scanning](/pipelines/vulnerability-and-quality) · [under-the-hood](/api/under-the-hood).

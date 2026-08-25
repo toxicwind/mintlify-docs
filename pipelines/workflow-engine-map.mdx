@@ -1,0 +1,110 @@
+---
+title: "Workflow Engine Map: CI, Cron, and What Actually Runs"
+sidebarTitle: "Workflow Engine Map"
+description: "Mapping every CI trigger, cron cadence, and deploy hook across the toxicwind estate, plus what each stage actually validates and the gaps it leaves."
+---
+
+The toxicwind estate does not have a sprawling, multi-repo DevOps mesh. It has one dominant CI file: `additional-lens-profiles/.github/workflows/ci.yml`, and a long tail of repositories that ship no automation at all. This page maps what triggers work, what cadence they run on, what they validate, and, more importantly, what they skip.
+
+## Workflow inventory
+
+The table below lists every GitHub Actions workflow file the shipped corpus is known to contain. Most peripheral repositories have no CI of any kind.
+
+| Repository | Workflow path | Triggers | What it runs | What it emits |
+| --- | --- | --- | --- | --- |
+| `additional-lens-profiles` | `.github/workflows/ci.yml` | `push`, `pull_request`, `schedule` (cron) | `py_compile` over `src/nvidia_swarm/*.py`, `src/iptv_discovery/*.py`, `src/benchmarks/*.py` | Pass/fail per matrix job |
+| `python-sdk-auditor` | none | none | none | none |
+| `awesome-api-shape-explorer` | none | none | none | none |
+| `sovereign-scripts` | none | none | none | none |
+| `youtube-403-bypass` | none | none | none | none |
+| `neo-osint` | none | none | none | none |
+
+The entire estate is therefore carried by a single matrix job inside one repository. That job validates syntax and import resolution across three `src/` subdirectories, and nothing else.
+
+## The dominant pipeline
+
+Below is the shape of `additional-lens-profiles/.github/workflows/ci.yml`, reconstructed from the facts above. It uses a standard matrix over Python 3.11 and 3.12, compiles the listed source trees with `py_compile`, and exits. There is no artifact upload, no coverage collection, and no test runner.
+
+<CodeGroup>
+
+```yaml additional-lens-profiles/.github/workflows/ci.yml
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Runs every 6 hours
+    - cron: '0 */6 * * *'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: py_compile src/nvidia_swarm
+        run: python -m py_compile src/nvidia_swarm/*.py
+      - name: py_compile src/iptv_discovery
+        run: python -m py_compile src/iptv_discovery/*.py
+      - name: py_compile src/benchmarks
+        run: python -m py_compile src/benchmarks/*.py
+```
+
+</CodeGroup>
+
+<Note>
+  `py_compile` catches syntax errors and unresolved top-level imports. It does not execute code, exercise branches, or verify runtime behavior. A module could import `tensorflow`, fail at runtime because CUDA is missing, and still pass this stage.
+</Note>
+
+## Trigger cadence and intent
+
+The workflow fires on three events. The push and pull request triggers are conventional. The cron schedule is where the design intent becomes visible.
+
+<Accordion title="Why cron every 6 hours">
+  The `additional-lens-profiles` repository ingests remote data bundles under `data/aug2026/*.jsonl`. These files are large (216 KB each) and duplicated across `.py`, `.json`, and `.jsonl` extensions in the same tree. The cron schedule re-triggers the workflow to catch upstream mtime changes on those bundles, not to run a regression test suite.
+
+  In practice, this means the CI cron is a mirror-refresh mechanism disguised as continuous integration. The swarm consumes refreshed JSONL profiles, and the workflow confirms the consuming code still compiles before the next ingest cycle begins.
+</Accordion>
+
+<Accordion title="What the pipeline does not do">
+  The absence is more informative than the presence. The single CI file does not include any of the following:
+
+  - **Dependency graph diff**: No lockfile is generated or compared between runs.
+  - **License audit**: No `pip-licenses`, `fossa`, or equivalent step scans for copyleft or incompatible terms.
+  - **SBOM generation**: No CycloneDX or SPDX artifact is produced.
+  - **CodeQL**: Static security analysis is not enabled.
+  - **Dependabot config**: No `.github/dependabot.yml` is visible in the shipped tree.
+  - **Coverage report**: No `pytest-cov`, `coverage.py`, or similar tool runs.
+  - **Artifact upload**: Compiled bytecode or test logs are not persisted.
+
+  The pipeline is intentionally minimal. It confirms the code is still syntactically valid and that top-level imports resolve. Everything else is deferred to the operator.
+</Accordion>
+
+## Deployment hooks
+
+There are no deployment hooks in the estate. The swarm does not deploy as a service; it runs out of a local clone. The operator checks out the repository, installs dependencies manually, and executes `swarm_maximal.py` directly.
+
+The `sovereign-scripts` repository contains helper utilities like `pip_with_fallback` and `ensure_imports`, but these are runtime bootstrapping tools, not CI-deployed artifacts. The `youtube-403-bypass` `install.sh` script is a local setup helper, not a deployment pipeline. There is no Kubernetes manifest, no Docker image build, no release asset upload, and no environment promotion stage.
+
+<Warning>
+  If you are expecting blue-green deploys, canary releases, or automated rollbacks, this is the wrong estate. The operational model is clone, verify with `py_compile`, and run.
+</Warning>
+
+## Runtime profiles the pipeline touches
+
+The CI file compiles sources for three subsystems. The most relevant is `src/nvidia_swarm/`, which contains the swarm orchestrator and its dependencies. The `swarm_maximal.py` module inside that directory defines the `LensSwarmOrchestrator` class, the `LensProfile` dataclass, and the `TritonGrpcTransport` stub. Because the pipeline only compiles this file, it will not detect that `TritonGrpcTransport` is a functional stub whose `infer` method awaits `asyncio.sleep(0.012)` and returns synthetic data.
+
+The `src/benchmarks/` directory presumably contains timing or load scripts, and `src/iptv_discovery/` contains ancillary ingestion code. Neither is exercised at runtime by the CI job.
+
+## Cross-references
+
+- For how the vulnerability and quality surface is monitored without CI, see [Vulnerability and Quality](/pipelines/vulnerability-and-quality).
+- For failure modes specific to the swarm pipeline, including stub transports and data duplication, see [Failure Vectors](/pipelines/failure-vectors).
+- For how to bootstrap the runtime environment this pipeline assumes already exists, see [Zero-Magic Bootstrap](/setup/zero-magic-bootstrapping).

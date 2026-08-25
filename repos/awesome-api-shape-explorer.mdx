@@ -1,0 +1,121 @@
+---
+title: "awesome-api-shape-explorer: AST Signature Extractor with 3.8 Fallback"
+sidebarTitle: "awesome-api-shape-explorer"
+description: "AST-based Python signature extractor with naive cyclomatic counting, a manual 3.9 unparse fallback, broken pyproject entry point, and zero tests. Reads source, prints shapes."
+---
+
+`awesome-api-shape-explorer` is one of the estate's smaller utility scripts, a single-purpose analyzer that walks Python source, reconstructs function and class signatures from the AST, estimates complexity by counting nodes, and outputs JSON or truncated Markdown. It has no tests, no CI, and its `pyproject.toml` entry point resolves to a module path that does not exist in the source tree. I am not sure whether the entry point was broken from the first commit or if a refactor moved `api_shape_explorer.py` into `src/` and the packaging metadata was simply forgotten. In this workshop, the distinction rarely matters. The tool is invoked by `python src/cli.py <path>`, not by `pip install`, so the defect is ornamental.
+
+If you have read the auditor at [`/repos/python-sdk-auditor`](/repos/python-sdk-auditor), you already understand the estate's relationship with AST introspection: it is treated as archaeology, not engineering. `awesome-api-shape-explorer` continues that tradition with a narrower scope. No policy enforcement, no compliance checklist, just signature extraction and a rough heat map of branching density.
+
+## The three dataclasses
+
+The entire surface model is three dataclasses: `FunctionShape`, `ClassShape`, and `ModuleShape`. The estate does not use Pydantic here, and there are no validators, no defaults, no serialization mixins. Plain `dataclass` is sufficient because the output is consumed by `json.dumps` with a default handler, or by a handful of f-strings in the Markdown path.
+
+```python
+@dataclass
+class FunctionShape:
+    name: str
+    args: List[str]
+    kwonly: List[str]
+    returns: Optional[str]
+    is_async: bool
+    decorators: List[str]
+    docstring: Optional[str]
+    complexity: int
+    line_no: int
+```
+
+`args` and `kwonly` store stringified AST nodes, not semantic parameter objects. `returns` is whatever `ast.unparse` (or the manual fallback) produces for the annotation expression. `complexity` is the naive node counter described later. `line_no` is the AST `lineno`, which is technically the line of the `def` token, not the docstring.
+
+```python
+@dataclass
+class ClassShape:
+    name: str
+    bases: List[str]
+    methods: List[FunctionShape]
+    class_vars: List[str]
+    decorators: List[str]
+    docstring: Optional[str]
+    line_no: int
+```
+
+`class_vars` is a flat list of stringified targets from `ast.AnnAssign` and `ast.Assign` at class body scope. It does not distinguish between mutable defaults and descriptors. If a class variable is a walrus expression or a starred unpacking, the extraction will either skip it or produce nonsense. The tool does not promise completeness; it promises a shape.
+
+```python
+@dataclass
+class ModuleShape:
+    path: str
+    imports: List[str]
+    functions: List[FunctionShape]
+    classes: List[ClassShape]
+    module_docstring: Optional[str]
+```
+
+`imports` is a flat list of `ast.Import` and `ast.ImportFrom` nodes, rendered as strings. There is no attempt to resolve relative imports or detect unused names. The module shape is a snapshot, not a dependency graph.
+
+## The 3.8 fallback ghost
+
+The estate supports Python 3.8 because I have encountered enough legacy environments that "3.9\+ only" is an unearned luxury. The analyzer uses `ast.unparse` to turn annotation nodes back into strings, which avoids writing a full type-expression printer. But `ast.unparse` arrived in 3.9, so there is a manual visitor for older runtimes.
+
+```python
+def _unparse(self, node):
+    if node is None:
+        return ""
+    if PY_VER >= (3, 9):
+        return ast.unparse(node)
+    # Manual visitor covers Name, Constant, Attribute, Subscript, List, Tuple, Call
+    # Falls through to `return "..."` for anything exotic
+```
+
+The visitor handles `Name`, `Constant`, `Attribute`, `Subscript`, `List`, `Tuple`, and `Call`. Anything else: `Starred`, `Slice`, `NamedExpr`, `IfExp`, `BinOp`, `Await`, `Yield`, `Lambda`, whatever an intern might embed in a type hint because they saw it on a blog: all of it collapses into `"..."`.
+
+This is the estate's cynicism condensed into three characters. If the signature contains an exotic expression, the analyzer does not warn you, does not raise, does not skip the function. It emits a lie by omission. The JSON output will show `"returns": "..."` and you, the reader, are expected to know that this means "the tool gave up." In practice this almost never matters, because the codebase being analyzed is usually the same vintage as the tool itself, and 3.8-compatible code rarely annotates with `NamedExpr`. But the fallback is there, quietly misrepresenting, and that is its charm.
+
+## Cyclomatic complexity, McCabe 1976, applied wrong
+
+The analyzer attempts to flag "complex" functions with a single number:
+
+```python
+complexity = 1 + sum(1 for n in ast.walk(node) if isinstance(n, (
+    ast.If, ast.While, ast.For, ast.ExceptHandler,
+    ast.With, ast.Assert, ast.comprehension
+)))
+```
+
+This is not Thomas McCabe's cyclomatic complexity. It double-counts `with` statements because `ast.With` contains one `withitem` per context manager, but the walker counts the `With` node itself regardless of how many items it wraps. It conflates list/dict/set comprehensions with branching by counting `ast.comprehension`, which is an iteration construct, not a decision. It completely ignores `and` and `or` short-circuit expressions, which in McCabe's model add decision points because they introduce implicit branches. `ast.BoolOp` is absent from the tuple.
+
+<Info>
+  If you care about accurate McCabe computation, see [`/archaeology/ast-and-technical-debt`](/archaeology/ast-and-technical-debt). The estate keeps a separate note on what a correct visitor would look like. This tool does not implement it.
+</Info>
+
+So what is the number good for? Heat maps. When you run the tool against an unfamiliar module and one function scores 34 while the rest score 3 to 7, you know where to start reading. The tool is a compass, not a gate. Using this value as a CI threshold would be malpractice, which is why there is no CI.
+
+## CLI and outputs
+
+The interface is intentionally thin:
+
+```bash
+python src/cli.py <path> [-f json|markdown] [-o <output>]
+```
+
+The default format is JSON, which dumps the `ModuleShape` through a small default handler for `set` and `datetime`. The Markdown path is more opinionated: it truncates docstrings at 100 characters with a hard-coded slice that cannot be configured. If your docstring is 101 characters, character 101 is discarded without ellipsis. This is not a bug; it is a boundary. The estate does not write 101-character docstrings.
+
+Markdown output is suitable for pasting into a README or a commit message. JSON output is suitable for piping into `jq` and then into another script. There is no intermediate format, no streaming mode, no parallel processing. A 100,000-line module will block the interpreter while `ast.parse` chews through it. If you need speed, use a compiled parser or stop analyzing 100,000-line modules.
+
+## The broken entry point
+
+The `pyproject.toml` declares:
+
+```toml
+[project.scripts]
+awesome-api-shape-explorer = "awesome_api_shape_explorer.cli:main"
+```
+
+But the source layout places `cli.py` at `src/cli.py`, and the module inside it imports from `api_shape_explorer`, not `awesome_api_shape_explorer`. A fresh `pip install -e .` will succeed at the build phase and then fail at runtime when the console script attempts to import a package that does not exist in `site-packages`. Nobody has noticed because the estate does not install Python tools. The intended invocation has always been `python src/cli.py <path>`, and the `pyproject.toml` metadata is dead weight, a packaging aspiration left to rot like a TODO comment in a function that was never called.
+
+I have considered fixing it, but that would imply the tool is meant to be distributed, which would imply it deserves tests, which would imply it has a stability guarantee, which would be a bigger lie than `"..."`.
+
+## Relationship to the rest of the estate
+
+`awesome-api-shape-explorer` is a narrower sibling of the auditor at [`/repos/python-sdk-auditor`](/repos/python-sdk-auditor). Both walk ASTs, both lack tests, both treat source as archaeological layers rather than products. The difference is scope: the auditor is concerned with dependency policy and typing discipline; the shape explorer only cares about surface signatures and a rough branching estimate. If you are mapping an unknown module, start here. If you are enforcing a policy, use the auditor. If you need accurate McCabe metrics, write your own visitor, or see [`/archaeology/ast-and-technical-debt`](/archaeology/ast-and-technical-debt) for notes on what the estate got wrong and why.

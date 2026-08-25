@@ -1,13 +1,12 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "theme": "aspen",
+  "name": "toxicwind Codex",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#7c3aed",
+    "light": "#a78bfa",
+    "dark": "#4c1d95"
   },
-  "favicon": "/favicon.svg",
   "navigation": {
     "pages": [
       {
@@ -18,55 +17,75 @@
         ]
       }
     ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
-  "navbar": {
-    "links": [
+    "tabs": [
       {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "index"
+            ]
+          },
+          {
+            "group": "Software Archaeology",
+            "pages": [
+              "archaeology/sunk-cost-blueprint",
+              "archaeology/ast-and-technical-debt",
+              "archaeology/state-and-dependency-lifecycle"
+            ]
+          },
+          {
+            "group": "Local Setup",
+            "pages": [
+              "setup/hardware-and-runtime",
+              "setup/zero-magic-bootstrapping",
+              "setup/isolation-and-sandboxing"
+            ]
+          },
+          {
+            "group": "CI, Deployment, Mutation",
+            "pages": [
+              "pipelines/workflow-engine-map",
+              "pipelines/vulnerability-and-quality",
+              "pipelines/failure-vectors"
+            ]
+          },
+          {
+            "group": "API & Subroutines",
+            "pages": [
+              "api/interface-schema",
+              "api/under-the-hood"
+            ]
+          },
+          {
+            "group": "Swarm Ops",
+            "pages": [
+              "swarm/mcp-registry",
+              "swarm/daemon-hot-reload",
+              "swarm/argv-lens-picker",
+              "swarm/env-and-unlocks"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Repository Codex",
+        "groups": [
+          {
+            "group": "Primary Artifacts",
+            "pages": [
+              "repos/additional-lens-profiles",
+              "repos/python-sdk-auditor",
+              "repos/awesome-api-shape-explorer",
+              "repos/sovereign-scripts",
+              "repos/youtube-403-bypass",
+              "repos/neo-osint",
+              "repos/peripheral-corpus"
+            ]
+          }
+        ]
       }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
-    }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
     ]
-  },
-  "footer": {
-    "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
-    }
   }
 }

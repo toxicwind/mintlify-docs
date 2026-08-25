@@ -1,0 +1,107 @@
+---
+title: "sovereign-scripts: Rate-Limit Autopilot and PyPI Mirror Fallback"
+sidebarTitle: "sovereign-scripts"
+description: "Shared helper utilities for GitHub API rate-limit tracking, PyPI CDN fallback mirrors, and rootless Linux namespace isolation used across the toxicwind estate."
+---
+
+`sovereign-scripts` is not a product. It is a utility drawer: the shared scaffolding that other repos in the estate reach for when they need GitHub API access, package installation resilience, or a cheap isolation boundary. You will not run it directly. You will import `sovereign_helper` from a sibling project and hope the author remembered to document the environment variables it expects. (He did not.)
+
+The repo contains three functional units: a Python helper module with async GitHub client logic and a pip fallback chain, a rootless Linux namespace wrapper, and a Playwright MITM proxy launcher buried in a subdirectory. The Playwright piece is essentially a stub, so this page covers the parts that actually carry weight.
+
+## What imports this
+
+Several repos in the estate depend on `sovereign-scripts` as a runtime or setup dependency:
+
+- **`additional-lens-profiles`** pulls it in via `setup.sh` to bootstrap its CI environment and benchmark harness. See [/repos/additional-lens-profiles](/repos/additional-lens-profiles) for the only repo in the estate with actual continuous integration.
+- Batched GitHub API work across the estate reuses `GitHubClient` rather than reimplementing header parsing and sleep logic. The author clearly got tired of writing the same `X-RateLimit-Remaining` check in every scraper.
+- Any tooling that needs to install Python packages inside a restricted network environment calls `pip_with_fallback` instead of assuming `pypi.org` is reachable.
+
+If you are reading this page, you are probably debugging why one of those downstream repos failed to authenticate, install, or isolate.
+
+## RateLimit \+ GitHubClient
+
+The `sovereign_helper.py` module defines a `RateLimit` dataclass and an async `GitHubClient` that wraps `aiohttp.ClientSession` under an `asyncio.Lock`.
+
+```python
+@dataclass
+class RateLimit:
+    limit: int = 5000
+    remaining: int = 5000
+    reset_at: int = 0
+    resource: str = 'core'
+
+class GitHubClient:
+    # aiohttp.ClientSession under asyncio.Lock
+    # Parses X-RateLimit-Remaining, X-RateLimit-Reset headers on every response
+    # Preemptive sleep when remaining drops below threshold (does NOT wait for 403)
+    # Requires GITHUB_TOKEN env var
+    async def get_repos(...): ...
+    async def get_repo(owner, repo): ...
+```
+
+This is the single most surgical optimization in the entire estate. Most hobbyist GitHub scrapers either ignore rate limits entirely and get 403-banned, or they naively sleep for a fixed interval between every request. The `GitHubClient` implementation parses the `X-RateLimit-Remaining` and `X-RateLimit-Reset` headers on every response and preemptively sleeps when the remaining quota drops below a threshold. It does not wait for the server to slap it with a 403.
+
+<Info>
+  The `GITHUB_TOKEN` environment variable is mandatory. The client will not fall back to unauthenticated requests, and it will not warn you gracefully if the token is missing. It will simply fail.
+</Info>
+
+The design is pragmatic for a solo-author workshop: one shared session, one lock, header inspection on every response. For the actual API contract and how the estate consumes it, see [/api/under-the-hood](/api/under-the-hood).
+
+## pip\_with\_fallback
+
+The `pip_with_fallback` function attempts package installation against a hardcoded list of PyPI mirrors:
+
+```python
+PYPI_MIRRORS = [
+    'https://pypi.org/simple',
+    'https://mirrors.aliyun.com/pypi/simple',
+    'https://pypi.tuna.tsinghua.edu.cn/simple',
+]
+
+def pip_with_fallback(packages):
+    for mirror in PYPI_MIRRORS:
+        try:
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-i', mirror, *packages], timeout=60)
+            return mirror
+        except subprocess.CalledProcessError:
+            continue
+    raise RuntimeError('All PyPI mirrors failed')
+```
+
+This solves BGP-level censorship and geographic latency, not supply-chain resilience. If `pypi.org` yanks a malicious version, `aliyun` and `tsinghua` will typically reflect that yank. The fallback mirrors are China-mainland CDNs, which suggests the author occasionally runs this code from behind the Great Firewall or simply wants the bandwidth. It does not verify package hashes, signatures, or provenance. It just tries the next mirror when `subprocess.check_call` throws.
+
+<Warning>
+  The timeout is 60 seconds per mirror. If you are installing something large or compiling from source, this will abort prematurely and move to the next mirror, which will also abort. Adjust the timeout if you are doing anything heavier than pure-Python wheels.
+</Warning>
+
+## unshare-root.py
+
+The `unshare-root.py` script creates a rootless mount and user namespace using Linux `unshare(2)`:
+
+- Calls `unshare(CLONE_NEWNS | CLONE_NEWUSER)`
+- Remaps uid 0 inside the namespace to the real uid outside
+- Bind-mounts a read-only prefix plus a writable `$CWD`
+- Does **not** unshare the network namespace; network remains accessible
+- Requires `kernel.unprivileged_userns_clone=1` (enabled by default on Debian and Ubuntu; disabled by policy on RHEL and its derivatives)
+
+This is workshop-grade isolation: real enough to prevent accidents like a runaway script deleting `/usr`, not real enough to defend against a determined actor. The network namespace is shared, so any outbound connections, DNS resolution, and network-visible side effects leak through unchanged. The uid remapping is a comfort measure, not a security boundary.
+
+If you are running on RHEL, Fedora, or any system with `kernel.unprivileged_userns_clone=0`, the script will fail and you will need to either enable the sysctl or accept that you are running without namespace isolation. The author did not include a fallback.
+
+## The Kimi leak
+
+`sovereign_helper.py` reads two environment variables that appear nowhere in any `.env.example` file across the estate:
+
+- `KIMI_PROJECT_PORTAL_CAPABILITY_ENV`
+- `KIMI_PROJECT_PORTAL_CAPABILITY_PROD_ADDR`
+
+These are the deployment substrate's fingerprint leaking through the code. The author works inside a Moonshot AI / Kimi ecosystem and simply forgot to abstract the platform-specific configuration out of a shared helper module. There is no documentation for what these variables control, what format they expect, or whether downstream repos break if they are absent. They are load-bearing but undocumented, which is exactly the kind of implicit dependency that makes estate maintenance brittle.
+
+If you are porting any of this code outside the Kimi portal environment, grep for those strings and decide whether to stub them, remove them, or reverse-engineer their semantics from whatever runtime errors you encounter.
+
+## Cross-references
+
+- For the only repo that actually exercises this code in CI, see [/repos/additional-lens-profiles](/repos/additional-lens-profiles).
+- For the API internals that `GitHubClient` consumes, see [/api/under-the-hood](/api/under-the-hood).
+- For the estate's hand-rolled binary container format used to smuggle large payloads through git, see the common ground notes on ArchiveFS (`ARFS\x01\x02` magic, 256-byte header, 85MB chunking).
+- For other repos in the workshop, see [/repos/python-sdk-auditor](/repos/python-sdk-auditor), [/repos/awesome-api-shape-explorer](/repos/awesome-api-shape-explorer), [/repos/youtube-403-bypass](/repos/youtube-403-bypass), [/repos/neo-osint](/repos/neo-osint), and [/repos/peripheral-corpus](/repos/peripheral-corpus).

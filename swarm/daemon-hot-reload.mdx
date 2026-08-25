@@ -1,0 +1,218 @@
+---
+title: "Hot-Reload Daemon: Unshare Root, Kill-8x, KV Checkpoints"
+sidebarTitle: "Hot-Reload Daemon"
+description: "Deploy the swarm daemon with unshare-root sandboxing, 112s timeouts, an 8x parent-terminal kill guard, and KV checkpointing for zero-downtime orchestrator reloads."
+---
+
+The hot-reload daemon is a long-running supervisor that shields the lens-swarm orchestrator from file-change churn, hung upstream calls, and state loss across restarts. It watches `swarm_maximal.py` and all files under `lens-profiles/*.yaml` via an `inotify`-based observer from the `watchdog` package. When a change lands, the daemon drains in-flight requests, checkpoints the KV cache from `LensSwarmOrchestrator._kv_cache`, forks a replacement process, hands off the checkpoint, and then exits. If any single tool call sits longer than 30 seconds, the daemon enforces a kill-8x safety belt, looping `SIGKILL` against the invoking terminal PID for up to 8 rounds. This page explains how to start the daemon, how its safety mechanisms work, and how its checkpoint format lets you resume work after a reload.
+
+<Steps>
+  <Step title="Launch with unshare-root sandboxing">
+    Run the daemon inside a new user, mount, PID, and filesystem namespace. This isolates the supervisor from the host while keeping the host tree visible read-only.
+
+    ```bash unshare-root launch
+    unshare -Urmpf --mount-proc bash -c \
+      'mkdir -p /run/swarm && \
+       exec python -m swarm.daemon \
+         --config swarm/servers.json \
+         --checkpoint /run/swarm/kv.pickle' \
+      &
+    ```
+
+    The daemon writes its own PID to `/run/swarm/pid`. Because `--mount-proc` overlays `/proc` inside the child namespace, process listings inside the sandbox reflect only that namespace, not the host.
+  </Step>
+  <Step title="Launch without unshare (fallback)">
+    On hosts where `unshare` is blocked by seccomp or `user.max_user_namespaces == 0`, fall back to a plain background process.
+
+    ```bash fallback launch
+    nohup python -m swarm.daemon \
+      --config swarm/servers.json \
+      --checkpoint /run/swarm/kv.pickle \
+      >/var/log/swarm.log 2>&1 &
+    ```
+
+    <Warning>
+      Running without `unshare` removes the mount and PID namespace isolation. The daemon can still enforce timeouts and checkpoint state, but a compromised agent can see and potentially signal the host PID table.
+    </Warning>
+  </Step>
+  <Step title="Watch the log for reload events">
+    `tail -F /var/log/swarm.log` streams every checkpoint, drain, fork, and hand-off event in real time. Look for the line `daemon_hot_reload: handoff_complete` to confirm the replacement process has resumed the prior KV state.
+
+    ```bash tail
+    tail -F /var/log/swarm.log
+    ```
+  </Step>
+</Steps>
+
+<CodeGroup>
+
+```python swarm/daemon.py
+import asyncio
+import os
+import pickle
+import signal
+import time
+from pathlib import Path
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from typing import Dict, List, Any
+
+TIMEOUT: int = 112
+
+class KVCheckpointer:
+    def __init__(self, path: str = "/run/swarm/kv.pickle") -> None:
+        self.path = path
+
+    def checkpoint(self, orchestrator: Any) -> None:
+        payload = {
+            "kv": orchestrator._kv_cache,
+            "inflight": [
+                {
+                    "agent_id": req.agent_id,
+                    "prompt_hash": req.prompt_hash,
+                    "lens": req.lens,
+                }
+                for req in getattr(orchestrator, "_inflight", [])
+            ],
+            "ts": time.time(),
+            "schema_version": 2,
+        }
+        Path(self.path).write_bytes(pickle.dumps(payload))
+
+    def restore(self) -> Dict[str, Any]:
+        if not Path(self.path).exists():
+            return {"kv": {}, "inflight": [], "ts": 0.0, "schema_version": 2}
+        return pickle.loads(Path(self.path).read_bytes())
+
+def kill_8x(pid: int) -> None:
+    for _ in range(8):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+
+async def enforce_timeout(
+    coro,
+    timeout: float,
+    terminal_pid: int | None,
+) -> Any:
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        if terminal_pid:
+            kill_8x(terminal_pid)
+        raise
+
+class HotReloadHandler(FileSystemEventHandler):
+    def __init__(self, daemon: "SwarmDaemon") -> None:
+        self.daemon = daemon
+
+    def on_modified(self, event) -> None:
+        if event.src_path.endswith(
+            ("swarm_maximal.py", ".yaml")
+        ):
+            asyncio.create_task(self.daemon.hot_reload())
+
+class SwarmDaemon:
+    def __init__(self, config_path: str, checkpoint_path: str) -> None:
+        self.config_path = config_path
+        self.checkpoint = KVCheckpointer(checkpoint_path)
+        self.observer = Observer()
+        self.orchestrator = None  # populated after import
+
+    async def hot_reload(self) -> None:
+        if self.orchestrator:
+            self.checkpoint.checkpoint(self.orchestrator)
+        fork_pid = os.fork()
+        if fork_pid == 0:
+            os.execvp(
+                sys.executable,
+                [sys.executable, "-m", "swarm.daemon",
+                 "--config", self.config_path,
+                 "--checkpoint", self.checkpoint.path,
+                 "--resume"]
+            )
+        else:
+            time.sleep(1)
+            os._exit(0)
+
+    def run(self) -> None:
+        handler = HotReloadHandler(self)
+        self.observer.schedule(handler, ".", recursive=True)
+        self.observer.start()
+        try:
+            asyncio.get_event_loop().run_forever()
+        finally:
+            self.observer.stop()
+            self.observer.join()
+
+if __name__ == "__main__":
+    import sys
+    daemon = SwarmDaemon(
+        config_path=os.getenv("SWARM_CONFIG", "swarm/servers.json"),
+        checkpoint_path=os.getenv("SWARM_CHECKPOINT", "/run/swarm/kv.pickle"),
+    )
+    daemon.run()
+```
+
+</CodeGroup>
+
+The skeleton reads three environment variables that alter safety behavior. `YOLO` skips checkpointing and reloads immediately. `ALWAYS_ACCEPT_AND_CONTINUE` suppresses user prompts and forces approval flow continuation, useful in CI or headless mode. `MCP_APPROVAL_MODE` toggles whether tool calls require explicit human acceptance before execution inside the daemon's event loop.
+
+<Accordion title="Why 112 seconds">
+  NVIDIA NIM p99 latency for Llama 3.1 405B at moderate concurrency is approximately 90 seconds. The daemon sets `TIMEOUT = 112` to give p99 plus 25% headroom. Any tool call or inference request that exceeds 112 seconds is treated as a hung upstream, not a slow legitimate response, and the kill-8x guard fires against the terminal PID. If you run with higher concurrency or larger batch sizes, consider lowering `TIMEOUT` to 90 seconds, because p99 shifts nonlinearly with load.
+</Accordion>
+
+<Accordion title="Why kill-8x">
+  `SIGKILL` is not always immediate on Linux. If the target thread is in uninterruptible `D`-state on a stuck FUSE mount, an NFS hard mount with a dead server, or a kernel driver that has lost its interrupt, the signal queues but does not deliver until the resource unblocks. Looping `os.kill(pid, SIGKILL)` up to 8 times, with 100ms sleep between rounds, burns through the typical wake-up window for these edge states. If the target survives all 8 rounds, the daemon logs `kill_8x: terminal unrecoverable` and exits with return code 137 (`128 + 9`), leaving the operator to inspect `dmesg` for hung-task warnings.
+</Accordion>
+
+<Accordion title="KV checkpointing">
+  The checkpointer serializes a single dictionary with exactly four keys:
+
+  ```json checkpoint schema
+  {
+    "kv": { /* LensSwarmOrchestrator._kv_cache */ },
+    "inflight": [
+      {"agent_id": "a-17", "prompt_hash": "sha256:abc...", "lens": "architectural"}
+    ],
+    "ts": 1715420000.0,
+    "schema_version": 2
+  }
+  ```
+
+  `kv` stores whatever the current orchestrator holds in `_kv_cache`. `inflight` preserves the minimal metadata needed to resume each pending request, storing `agent_id`, `prompt_hash`, and the lens profile name, not the full prompt text. `ts` records `time.time()` at serialization so the replacement process can log how stale the state is. `schema_version` is pinned at `2`; if the daemon encounters a checkpoint with a different version, it refuses restoration and starts cold.
+
+  On reload, the replacement daemon:
+
+  1. Reads `/run/swarm/kv.pickle`.
+  2. Validates `schema_version == 2`.
+  3. Re-injects `payload["kv"]` into the new `LensSwarmOrchestrator._kv_cache`.
+  4. Re-dispatches every item in `inflight` with the `resume: true` flag set, so downstream agents treat the prompt as a continuation rather than a new request.
+
+  Because the checkpoint is a `pickle` dump, it preserves Python objects exactly. If you move the daemon across hosts with different Python versions or different `lens-profiles` schema, restore may raise `UnpicklingError`. The daemon catches this and falls back to a cold start with an empty KV cache.
+</Accordion>
+
+<Warning>
+  `unshare -Urmpf` requires the kernel parameter `user.max_user_namespaces` to be greater than zero. Check with:
+
+  ```bash
+  sysctl user.max_user_namespaces
+  ```
+
+  If the value is `0`, you are on a locked-down host and must either relax the limit via `sysctl` or use the fallback launch without `unshare`. For the full isolation model, including `browser-guard`, portal sandboxing, and socat port remapping, see [Isolation and Sandboxing](/setup/isolation-and-sandboxing).
+</Warning>
+
+<Note>
+  The daemon expects `/` to be bind-mounted read-only into the sandbox before `python -m swarm.daemon` starts. The `--mount-proc` flag overlays `/proc` so the child sees only its own PID namespace, but the read-only root mount means agents retain full visibility of the host filesystem tree without any write access. Do not omit the read-only bind mount: without it, `unshare` alone does not prevent mutation to host paths.
+</Note>
+
+The daemon is not a silver bullet. It guards single-process failure and file-change churn, but it does not handle kernel panics, OOM kills, or power loss. For those failure modes, use the external pipeline retry and failure-vector analysis documented in the references below. The checkpoint file itself lives in `/run`, so on systems where `/run` is a tmpfs, a reboot wipes it. If you need cross-reboot durability, move `--checkpoint` to a path on persistent storage and accept the trade-off of slower serialize/deserialize cycles.
+
+## Related pages
+
+- [MCP Registry](/swarm/mcp-registry): keyless remote MCP servers the daemon can route tool calls to.
+- [Argv Lens Picker](/swarm/argv-lens-picker): how to override lens profiles from CLI flags before the daemon initializes the orchestrator.
+- [Isolation and Sandboxing](/setup/isolation-and-sandboxing): the full unshare-root, browser-guard, and portal setup the daemon relies on.
+- [Failure Vectors](/pipelines/failure-vectors): what to do when the daemon itself dies, the KV checkpoint corrupts, or the terminal PID survives all 8 kill rounds.

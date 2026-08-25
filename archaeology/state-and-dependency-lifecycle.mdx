@@ -1,0 +1,185 @@
+---
+title: "State, Environment, and the Dependency Cascade Lifecycle"
+sidebarTitle: "State & Dependencies"
+description: "Environment configuration, runtime flags, third-party module interactions, and the statistical probability of supply-chain cascade failure across the toxicwind estate."
+---
+
+The lifecycle of any toxicwind process begins with an environment probe and ends with a JSON dump. In between, the runtime tolerates missing keys, mirrored PyPI failures, and version drift the way a shell script tolerates them: with fallbacks, with retries, and with the assumption that something upstream will eventually work.
+
+## Initialization: Six Environment Variables, Zero Config Files
+
+`additional-lens-profiles/.env.example` declares the entire runtime contract for the swarm:
+
+```bash .env.example
+NVIDIA_API_KEY=nvapi-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+OPENROUTER_API_KEY=sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+CDP_TUNNEL_ENDPOINT=wss://your-cdp-tunnel.example.com
+CDP_TUNNEL_TOKEN=tkn_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+LENS_ENDPOINT=http://127.0.0.1:25115
+LENS_API_KEY= lens_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+There is a leading space in `LENS_API_KEY= lens_...`. This is a defect on disk. `python-dotenv` strips it, but a `bash export` would preserve the space and every subsequent `os.environ["LENS_API_KEY"]` lookup would compare against the wrong prefix. This is exactly the class of defect the estate's own auditor is designed to flag; it does not flag `.env.example` files because `.env.example` is not `.py`.
+
+<Note>
+  `sovereign_helper.py` additionally consults `KIMI_PROJECT_PORTAL_CAPABILITY_ENV` and `KIMI_PROJECT_PORTAL_CAPABILITY_PROD_ADDR`, which appear nowhere in `.env.example`. These are Kimi (Moonshot) portal variables injected by the deployment substrate the author works inside. They are load-bearing and undocumented outside this page.
+</Note>
+
+## Runtime Flags: The Lens Profile Registry
+
+`swarm_maximal.py::LENS_PROFILES` is the canonical registry of runtime concurrency, transport, and grammar settings. Three profiles cover the useful design space:
+
+| Profile | Transport | Concurrency | Batch | TPS Target | Grammar | Timeout |
+| --- | --- | --- | --- | --- | --- | --- |
+| `architectural` | `triton-grpc` | 64 | 32 | 2500 | regex | 20s |
+| `cognitive` | `http2-persistent` | 32 | 16 | 1800 | bnf | 20s |
+| `bleeding` | `triton-grpc` | 128 | 64 | 3500 | bnf | 20s |
+
+The default is `bleeding`. The rational default would be `architectural` (moderate concurrency, regex grammar which matches the actual implementation, HTTP/2 path that most NIM endpoints actually terminate). The author chose `bleeding` because the artifact is a lens experiment, not a production shim, and a default that saturates a semaphore of 128 is instructive when profiling on an H100.
+
+<CodeGroup>
+
+```python swarm_maximal.py LensProfile dataclass
+@dataclass
+class LensProfile:
+    name: str = "architectural"
+    transport: str = "triton-grpc"
+    concurrency: int = 64
+    batch_size: int = 32
+    tps_target: int = 2500
+    grammar_mode: str = "bnf"
+    kv_cache_optimized: bool = True
+    persistent_conn: bool = True
+    timeout_guard_sec: float = 20.0
+```
+
+```python swarm_maximal.py bleeding profile
+"bleeding": LensProfile(
+    name="bleeding",
+    transport="triton-grpc",
+    concurrency=128,
+    batch_size=64,
+    tps_target=3500,
+    grammar_mode="bnf",
+    kv_cache_optimized=True,
+    persistent_conn=True,
+    timeout_guard_sec=20.0,
+)
+```
+
+</CodeGroup>
+
+## The Dependency Bloat Ledger
+
+`additional-lens-profiles/requirements.txt` pins 14 packages spanning transport, ML, observability, and dev tooling:
+
+```text requirements.txt
+openai>=1.40.0
+httpx[http2]>=0.27.0
+asyncio
+aiohttp>=3.9.0
+nvidia-ml-py>=12.560.0
+pyppeteer>=2.0.0
+websockets>=12.0
+pyyaml>=6.0.1
+json5>=0.9.0
+pandas>=2.2.0
+prometheus-client>=0.20.0
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-cov>=5.0.0
+black>=24.0.0
+ruff>=0.5.0
+python-dotenv>=1.0.0
+```
+
+The `asyncio` line is bytes on disk that pip will accept and silently ignore because `asyncio` is stdlib. The `openai>=1.40.0` pin exists but no import of `openai` appears in `src/nvidia_swarm/`. `pandas>=2.2.0` (60MB, transitive `numpy>=1.23`, `python-dateutil`, `pytz`, `tzdata`) is present for exactly one purpose: converting the OSINT JSONL to Parquet in `parquet_converter.py`. `pyppeteer>=2.0.0` is an unmaintained fork; the maintained equivalent is `playwright`.
+
+### Cascade Failure Probability
+
+Estimating the annualized probability that any one of these dependencies breaks the swarm through a minor version bump:
+
+<Accordion title="Deriving the cascade probability">
+  Assumptions, conservatively drawn from public PyPI yank history and the last three years of GitHub Advisory Database:
+
+  - Each active dependency has a ~3% chance per year of shipping a breaking change in a minor version (e.g. `pydantic 1.x → 2.x`, `aiohttp 3.8 → 3.9`, `httpx 0.24 → 0.25`).
+  - `pyppeteer` (unmaintained) has a ~15% chance per year of ABI break against a supported Chromium.
+  - `nvidia-ml-py` follows the NVIDIA driver ABI; assume 5% per year of a breaking bump.
+
+  Let p = probability of at least one dependency breaking in the next 12 months:
+
+  p = 1 - ((1 - 0.03)^11) × (1 - 0.15) × (1 - 0.05) = 1 - (0.716) × (0.85) × (0.95) = 1 - 0.578 ≈ 0.42
+
+  There is roughly a 42% chance that a `pip install -r requirements.txt` in twelve months against unpinned upper bounds produces an environment that fails at import time. The two dominant terms are `pyppeteer` and the sheer count of `>=` pins with no upper bound.
+</Accordion>
+
+The mitigation the estate already ships:
+
+```python sovereign_helper.py CDN fallback
+PYPI_MIRRORS = [
+    "https://pypi.org/simple",
+    "https://mirrors.aliyun.com/pypi/simple",
+    "https://pypi.tuna.tsinghua.edu.cn/simple",
+]
+
+def pip_with_fallback(packages):
+    for mirror in PYPI_MIRRORS:
+        try:
+            subprocess.check_call([...] + packages, timeout=60)
+            return mirror
+        except subprocess.CalledProcessError:
+            continue
+    raise RuntimeError("All PyPI mirrors failed")
+```
+
+This solves the wrong problem. Multi-mirror fallback addresses BGP-level censorship (tsinghua is a China-mainland mirror, aliyun likewise), not version drift. If `aiohttp==3.10.5` yanks, all three mirrors return the same yank; the fallback is CDN redundancy, not supply-chain resilience.
+
+## The Third-Party Interaction Map
+
+<CodeGroup>
+
+```text NIM / Groq / OpenRouter fan-out
+swarm_main
+   │
+   ├── NvidiaSwarmDAG
+   │      └── agent.arun → aiohttp POST to $NVIDIA_BASE_URL/chat/completions
+   │             (openai-compatible schema, no openai client library)
+   │
+   ├── (case study 01) tasks/groq_osint.py
+   │      └── httpx.AsyncClient → https://api.groq.com/openai/v1
+   │             (groq-compound-mini until Aug 2025 deprecation)
+   │
+   └── (validation) cross-provider check
+          └── httpx → https://openrouter.ai/api/v1
+```
+
+```text Triton fan-out (swarm_maximal.py path)
+LensSwarmOrchestrator.execute
+   │
+   └── TritonGrpcTransport.infer
+          │
+          ├── pack_model_infer_request (BYTES + INT32 + FP32 tensors)
+          ├── semaphore.acquire (128 slot ceiling on 'bleeding')
+          ├── asyncio.timeout(20s)
+          └── SIMULATED await asyncio.sleep(0.012)
+                └── returns fake ModelInferResponse
+```
+
+</CodeGroup>
+
+<Warning>
+  The Triton gRPC transport in `swarm_maximal.py` is a stub. `await asyncio.sleep(0.012)` replaces the real gRPC call and the returned text is `f"[Triton gRPC: {self.model_name}] Infer completed across {self.profile.transport}."`. This is a benchmark scaffold, not a production transport. The TPS and TTFT numbers it emits are lower bounds on the network overhead of the semaphore \+ timeout machinery, not measurements of any real inference.
+</Warning>
+
+## The State That Survives Process Exit
+
+Three artifacts persist between runs:
+
+1. **`data/aug2026/*.json`** — swarm outputs checked into git. This is state-as-cache. Reproducing a case study reads these files instead of re-invoking NIM.
+2. **`.env` (never committed)** — the only real config surface. Rotating a leaked key requires editing this file, nothing else.
+3. **ArchiveFS `.arfs` chunks** — a custom container format defined in `swarm_maximal.py` for shipping \>85MB payloads across the CDP tunnel (documented in [interface schema](/api/interface-schema)). SHA-256 checksums are stored per entry in the header index.
+
+Cross-references: [bootstrap ritual](/setup/zero-magic-bootstrapping) · [failure modes](/pipelines/failure-vectors) · [subroutine surfaces](/api/under-the-hood).

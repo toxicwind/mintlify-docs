@@ -1,0 +1,124 @@
+---
+title: "Hardware, Runtime Targets, and the Absurd Resource Footprints"
+sidebarTitle: "Hardware & Runtime"
+description: "VRAM budgets, CPU scaling assumptions, and the exact runtime versions each toxicwind repository demands before it will produce a first byte."
+---
+
+The toxicwind estate makes no unified statement about hardware. Each artifact has its own implicit assumptions, and combining them requires a machine that is simultaneously a static-analysis workstation, a Chrome fleet host, and an H100 client. The GPU is optional for most tools; the browser fleet is not.
+
+## Runtime Versions, Grouped by Repository
+
+| Repository | Interpreter / Runtime | Notes |
+| --- | --- | --- |
+| `additional-lens-profiles` | Python 3.12 (CI-tested) | `py_compile` only, no runtime tests |
+| `python-sdk-auditor` | Python 3.8\+ (primary 3.12) | Stdlib only. Audits any version. |
+| `awesome-api-shape-explorer` | Python 3.8\+ (`ast.unparse` on 3.9\+) | Fallback visitor for 3.8 |
+| `sovereign-scripts` | Python 3.12 primary, 3.11/3.8 fallback | `from __future__ import annotations` for 3.8 compat of \` | \` syntax |
+| `youtube-403-bypass` | POSIX bash, `yt-dlp`, Deno (auto-installed) | Uses macOS/Linux/WSL; not Windows-native |
+| `sovereign-swap` (fork) | Go 1.21\+ | Upstream `mostlygeek/llama-swap` |
+| `swarm_maximal.py` | Python 3.11\+ (`asyncio.timeout`) | Requires PEP 654 syntax |
+
+<Note>
+  `asyncio.timeout()` (used in `swarm_maximal.py::TritonGrpcTransport.infer`) is a Python 3.11 addition. Running on 3.10 will `AttributeError` at the first inference call. There is no runtime version check.
+</Note>
+
+## Memory Budgets
+
+### Swarm (NIM Client Side)
+
+The `additional-lens-profiles` swarm runs on the client, not the H100. The client-side memory ceiling is set by three factors:
+
+<CodeGroup>
+
+```text Client memory math (bleeding profile)
+concurrency:           128 in-flight coroutines
+per-coro overhead:     ~40KB (aiohttp request state + prompt buffer)
+prompt buffer typical: ~8KB (system prompt + user + dep merges)
+──────────────────────────────────────────────────────────
+steady-state RSS:      ~12MB additional over interpreter baseline
+
+Peak RSS during a run of 6 agents × 5 handoffs each:
+  interpreter:          ~45MB
+  aiohttp pool:         ~15MB (TCPConnector limit=32, tls buffers)
+  in-flight requests:   ~12MB (bleeding profile)
+  transient dep merges: ~4MB
+  ────────────────────────
+  total:                ~76MB
+```
+
+```text CI runner budget (ubuntu-latest, 7GB RAM)
+py_compile pass:       ~120MB (peak, all modules loaded)
+benchmark job:         ~200MB (with pandas import)
+headroom:              ~6.6GB (plenty)
+```
+
+</CodeGroup>
+
+### Audit (Static Analysis)
+
+`python-sdk-auditor` peaks at the size of the largest single file's AST. A 118KB `aug2026_lens.py` produces a ~14MB AST in memory (Python's AST nodes are ~120 bytes each with tuple overhead). Auditing a 5,000-file scikit-learn tree fits inside 800MB RSS.
+
+### GPU Side (What Someone Else Is Paying For)
+
+The swarm targets Llama 3.1 405B via NIM:
+
+| Model | Precision | VRAM | Deployment |
+| --- | --- | --- | --- |
+| `meta/llama-3.1-405b-instruct` | FP8 (NVIDIA NIM) | ~450GB | 8× H100 SXM 80GB |
+| `nvidia/nemotron-3-super-120b-a12b` | FP8 | ~130GB | 2× H100 80GB |
+| `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` | FP8 | ~30GB | 1× H100 80GB |
+
+<Warning>
+  The estate treats these VRAM budgets as somebody else's problem. Running against `build.nvidia.com` is the assumed default. Self-hosting a 405B endpoint is not a documented path and the code contains no VRAM detection or CUDA guards.
+</Warning>
+
+## CPU Scaling Assumptions
+
+The three profiles bake in CPU assumptions that were never audited:
+
+<Accordion title="Concurrency vs core count (implicit ratios)">
+  - `architectural` profile: 64 concurrent coroutines. Assumes ≥4 physical cores. On a 2-core WSL2 host, the `asyncio` event loop context-switch overhead alone can consume 30% of a run's wall time.
+  - `bleeding` profile: 128 concurrent coroutines. Assumes ≥8 physical cores. On anything smaller, semaphore contention becomes the dominant latency term and the reported TPS is fantasy.
+  - `cognitive` profile: 32 concurrent coroutines. This is the only profile with a defensible ratio on a laptop.
+
+  Empirical rule: pick the profile whose `concurrency` value is ≤ 8× your physical core count. Anything higher and you are measuring `asyncio` scheduler jitter.
+</Accordion>
+
+## Ridiculous Implicit Requirements
+
+<Accordion title="1. `pyppeteer>=2.0.0` requires Chromium 115+">
+  `pyppeteer` downloads its own Chromium into `~/.local/share/pyppeteer` on first import. The download is 170MB. The launcher requires `libnss3`, `libgconf-2-4` (deprecated on Ubuntu 22.04\+), and `libatk-bridge2.0`. On a headless CI runner without X11, the launcher additionally requires `xvfb-run` as a wrapper. None of this is documented.
+</Accordion>
+
+<Accordion title="2. Deno auto-install (youtube-403-bypass)">
+  The `install.sh` script runs `curl -fsSL https://deno.land/install.sh | sh` if `deno` is missing. Deno itself is a 100MB V8 fork used for exactly one purpose: solving YouTube's obfuscated JavaScript player challenges. This is the single highest-leverage dependency in the estate; without it, no video downloads.
+</Accordion>
+
+<Accordion title="3. Browser cookie extraction requires an unlocked keychain (macOS)">
+  `yt-dlp --cookies-from-browser chrome` reads Chrome's cookie database, which is encrypted with a key stored in the macOS Keychain. On a fresh boot before login, the extraction returns `Extracted 0 cookies from chrome` and no video downloads. The `install.sh` script does not verify keychain access.
+</Accordion>
+
+<Accordion title="4. `nvidia-ml-py` requires a live NVIDIA driver">
+  `nvidia-ml-py>=12.560.0` is a Python binding to `libnvidia-ml.so`. On a machine without an NVIDIA driver (any Apple Silicon Mac, any AMD workstation, any CI runner without a GPU), the import succeeds but every subsequent call raises `NVMLError_LibraryNotFound`. `lens.nv_metrics` is imported unconditionally by `nvidia_swarm_core.py` and would crash if it were actually invoked. It is not invoked in the current codepath; this is a latent bug.
+</Accordion>
+
+<Accordion title="5. CDP tunnel over WSS is not localhost">
+  `CDP_TUNNEL_ENDPOINT=wss://your-cdp-tunnel.example.com` presumes a remote Chrome fleet reachable over the public internet with a bearer token. This is not `chromedriver` on `localhost:9222`. The estate expects a KasmVNC or similar service; `configs/vnc/kasmvnc.yaml` (3768 bytes) is the giveaway.
+</Accordion>
+
+## The Minimum Sane Workstation
+
+To exercise the full estate:
+
+| Component | Minimum | Comfortable |
+| --- | --- | --- |
+| CPU cores | 4 physical | 8 physical |
+| RAM | 8GB | 16GB |
+| Disk (working) | 5GB | 20GB |
+| Python | 3.11 | 3.12 |
+| Chrome/Chromium | 115\+ | latest |
+| Deno | any (auto-installed) | 1.40\+ |
+| NVIDIA driver | not required | 550\+ if self-hosting |
+| Network | 20 Mbps outbound | ≥100 Mbps for CDP tunnel |
+
+Cross-references: [bootstrap ritual](/setup/zero-magic-bootstrapping) · [isolation constraints](/setup/isolation-and-sandboxing) · [dependency lifecycle](/archaeology/state-and-dependency-lifecycle).

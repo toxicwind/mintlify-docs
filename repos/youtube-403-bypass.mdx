@@ -1,0 +1,91 @@
+---
+title: "youtube-403-bypass: yt-dlp Wrapper with Cookie Extraction and Deno JS Sandbox"
+sidebarTitle: "youtube-403-bypass"
+description: "A yt-dlp wrapper that extracts browser cookies and uses Deno to solve YouTube obfuscated player challenges. A curl|bash installer with no CI, no tests, and no supply-chain guarantees."
+---
+
+This is the estate's most user-facing artifact by strict download count. While the rest of the workshop targets developers, this one targets anyone who wants to download a YouTube video without reading a 403 error. It is a shell wrapper around yt-dlp that auto-detects your browser, extracts cookies, injects a rotating list of player clients, and delegates obfuscated JavaScript execution to a Deno sandbox. The entire installation is a single `curl | bash` one-liner. There is no CI, no test suite, and no versioning of the wrapper script itself.
+
+## The one-command bootstrap
+
+The `install.sh` script is the entire onboarding surface. It detects your OS (macOS, Linux, or WSL), installs yt-dlp via pip or Homebrew, installs Deno if missing, finds your browser (Chrome first, then Firefox), and writes a wrapper to `~/.local/bin/yt-dlp`. Finally, it appends `export PATH=$HOME/.local/bin:$PATH` to your shell rc file. The PATH injection is not idempotent. Run it twice and you get two identical lines. Run it three times and you get three. This is not a bug; it is simply unhandled.
+
+<CodeGroup>
+
+```bash install.sh
+# One-liner from the README
+curl -fsSL https://raw.githubusercontent.com/toxicwind/youtube-403-bypass/main/install.sh | bash
+```
+
+</CodeGroup>
+
+<Warning>
+  This is `curl | bash`, the exact anti-pattern the estate's own [python-sdk-auditor](/repos/python-sdk-auditor) is designed to flag. The auditor's `url` lint would scream at this. The estate ships the disease it diagnoses. If the raw.githubusercontent.com response is ever compromised, every installer executes whatever it returns. There is no signature verification, no checksum, and no rollback.
+</Warning>
+
+## What the wrapper injects
+
+After installation, `~/.local/bin/yt-dlp` is a thin shell wrapper that prepends four classes of flags before forwarding all arguments to the real yt-dlp binary:
+
+<CodeGroup>
+
+```bash ~/.local/bin/yt-dlp
+yt-dlp \
+  --cookies-from-browser <auto-detected> \
+  --extractor-args "youtube:player_client=web,mweb,android" \
+  --user-agent "Mozilla/5.0 ... Chrome/<current> Safari/537.36" \
+  "$@"
+```
+
+</CodeGroup>
+
+Each flag exists for a specific reason, and each will silently rot when YouTube rotates its defenses again.
+
+| Flag | Purpose | Failure mode |
+| --- | --- | --- |
+| `--cookies-from-browser` | Authenticates requests using your logged-in session | Chrome DB locked if browser is running; Snap Chromium sandbox blocks access; keychain prompt on macOS persists across all future calls |
+| `--extractor-args "youtube:player_client=web,mweb,android"` | Rotates through player client signatures to find one YouTube has not yet throttled | List is hardcoded; next rotation breaks extraction until wrapper is manually updated |
+| `--user-agent "Mozilla/5.0 ..."` | Spoofs a current Chrome user agent to match the cookies | String is static after install; Chrome version drift makes the mismatch detectable |
+| `"$@"` | Passes through all user arguments | None; this is the only part that works reliably |
+
+The wrapper is not versioned. There is no update mechanism beyond re-running the installer and hoping the raw GitHub URL still points to something sane.
+
+## The Deno dependency
+
+YouTube's obfuscated JavaScript player challenges require executing untrusted code. The estate chose Deno for this, not because it is the only option, but because its permission model (`--allow-net`, `--allow-read`) provides the right containment shape out of the box. Node.js would work but demands more manual sandboxing. V8 alone would work but lacks a permission surface. Deno bundles V8 with a permission-first CLI, which is convenient.
+
+The cost is approximately 100MB of runtime installed via `curl -fsSL https://deno.land/install.sh | sh` for the single purpose of running YouTube's obfuscated challenge scripts. This is aggressive. The install script does not check whether Deno is already present elsewhere on PATH. It runs the installer unconditionally if `deno` is not found. If you already manage Deno through a package manager, you now have two copies.
+
+## Failure modes
+
+The wrapper fails in predictable ways that the install script does not detect, log, or surface. For a broader taxonomy of how this estate handles failure, see [Failure vectors](/pipelines/failure-vectors).
+
+<Accordion title="Chrome running: zero cookies extracted">
+  If Chrome is open when the wrapper runs, its cookie database is locked. yt-dlp reports zero cookies extracted and continues with an unauthenticated request. The user sees a 403 and assumes the script is broken, not that they need to close their browser. There is no retry, no lock detection, and no warning.
+</Accordion>
+
+<Accordion title="Ubuntu Snap Chromium: sandboxed into uselessness">
+  Snap-packaged Chromium stores its profile inside a strict sandbox. The wrapper's browser detection finds the binary, but `--cookies-from-browser chrome` returns nothing because the cookie DB is invisible from the host filesystem. This is a known issue with Snap applications. The wrapper does not check for Snap packaging.
+</Accordion>
+
+<Accordion title="macOS keychain: grant persists forever">
+  On first run, macOS prompts for keychain access to decrypt Chrome's cookies. If the user clicks "Always Allow," that grant persists across all future yt-dlp calls for that UID. On a shared workstation, any other user process running as the same UID can now read those cookies without prompting again. This is a credential-theft primitive disguised as convenience.
+</Accordion>
+
+## The credential-theft footgun
+
+The `--cookies-from-browser` flag is the core mechanism, and it is also the core risk. When it works, it exports your authenticated YouTube session into yt-dlp's memory. When it works on a shared machine, it exports your session into any process running as your UID. The macOS keychain grant is the most egregious case, but even on Linux the cookie DB is readable by your user and any compromised process running as you.
+
+There is no opt-out in the wrapper. The flag is always injected. If you want to run yt-dlp without cookies, you must bypass the wrapper entirely and call the real binary directly. The wrapper does not document this.
+
+## Deployment via curl|bash
+
+The install script is fetched from `raw.githubusercontent.com` and piped directly to bash. This is the deployment pattern the estate's [python-sdk-auditor](/repos/python-sdk-auditor) would flag with its `url` lint: unverified remote execution with no checksum, no signature, and no rollback path. The irony is intentional, or at least consistent. The estate builds tools to audit supply chains while simultaneously ignoring its own advice.
+
+There is no CI on this repository. No GitHub Actions workflow compiles or tests the install script. No Dependabot alerts on the repository (though there is nothing to alert on, since the repo contains no lockfile). The only quality control is the README's copy-paste one-liner and the assumption that if it worked once it will work forever.
+
+## Cross-references
+
+- [python-sdk-auditor](/repos/python-sdk-auditor): The estate's own supply-chain linter, which would flag this installer's `curl | bash` pattern
+- [pipelines/failure-vectors](/pipelines/failure-vectors): A broader taxonomy of silent failures across the estate
+- [setup/isolation-and-sandboxing](/setup/isolation-and-sandboxing): How the estate thinks about containment, when it bothers to

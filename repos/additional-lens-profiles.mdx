@@ -1,0 +1,147 @@
+---
+title: "additional-lens-profiles: NVIDIA NIM Swarm Orchestrator"
+sidebarTitle: "additional-lens-profiles"
+description: "Additional-lens-profiles is a NVIDIA NIM swarm orchestrator with async DAG execution, lens-profile registries, and an OSINT pipeline. This page documents its architecture, tech-debt stratum, and operational quirks."
+---
+
+additional-lens-profiles is the flagship artifact of the toxicwind estate. At surface inspection it presents as a modest NVIDIA NIM swarm orchestrator with some extra lens profiles bolted on, but closer reading reveals something more idiosyncratic: an async DAG execution engine, a hand-rolled agent registry, three baked-in concurrency profiles, an OSINT harvester, and enough abandoned scaffolding in the `archive/` directory to constitute a minor geological stratum. This page covers what actually exists, what is merely aspirational, and what you should expect when you clone it.
+
+<CardGroup cols={3}>
+  <Card title="Architecture Overview" icon="diagram-project" href="#repository-layout">
+    Async DAG engine, Llama 3.1 native prompt format, grammar-constrained JSON decoding, and the lens profile registry.
+  </Card>
+
+  <Card title="Benchmark Surface" icon="gauge-high" href="#workflows-ci-benchmark-and-swarm">
+    CI via `py_compile`, a weekly NIM throughput matrix, and a cron-driven swarm harvester that commits outputs back to the repo.
+  </Card>
+
+  <Card title="OSINT Pipeline" icon="satellite-dish" href="#the-case-study-osint-module">
+    Groq compound-mini deprecation confirmed with an agent swarm, outputs persisted as `data/aug2026/*.jsonl`.
+  </Card>
+</CardGroup>
+
+## Repository Layout
+
+The repo sprawls. Files accumulate at root level with the restless energy of someone prototyping against a six-hour token budget. Here is the terrain.
+
+```text
+additional-lens-profiles/
+├── src/nvidia_swarm/          # swarm_main.py, nvidia_swarm_core.py (~145 loc),
+│                              # agents.py, tools/, tasks/
+├── src/iptv_discovery/        # separate small subsystem
+├── src/benchmarks/            # tps_benchmark.py etc.
+├── configs/                   # kasmvnc.yaml (3.7KB), browser_guard.py (28KB),
+│                              # s6-rc.d/ service definitions
+├── scripts/setup.sh           # bootstrap
+├── archive/                   # 20+ orphaned fix_*.py scripts (debt stratum)
+├── data/aug2026/*.jsonl      # checked-in swarm outputs
+├── .env.example               # LENS_API_KEY with a leading-space defect
+├── requirements.txt           # 14 pins
+└── .github/workflows/         # ci.yml, benchmark.yml, swarm.yml
+```
+
+**Root-level promiscuity.** The main modules, `nvidia_swarm_core.py`, `nvidia_swarm_agent.py`, `nvidia_swarm_transport.py`, `lens_profile.py`, and `swarm_maximal.py` all live directly in the repo root alongside the `README.md`, `requirements.txt`, and random transient outputs like `MAXIMAL_architect_141705.md`. There is no `src/` gatekeeping for the core engine. The `src/` directory does exist, but it houses `iptv_discovery/` and `benchmarks/` subsystems that feel like afterthoughts, plus an `nvidia_swarm/` subdirectory that replicates some of what already exists at root. This is not a project that believes in single sources of truth.
+
+**configs/ dominates.** `browser_guard.py` is 28KB, which makes it larger than the swarm core itself. The `kasmvnc.yaml` and `s6-rc.d/` service definitions suggest a VNC-isolated browser environment, probably for OSINT crawling, but the relationship to the swarm engine is left as an exercise to the reader. See the section on `browser_guard.py` in [known defects](#known-defects) for further lamentation.
+
+## The Async DAG Engine
+
+The computational heart is `NvidiaSwarmDAG` in `nvidia_swarm_core.py`. It is a respectable bit of engineering: an async context manager that builds an `aiohttp` session with connection pooling, a `Semaphore(16)` for concurrency gating, and a topological run loop that executes all ready nodes in parallel via `asyncio.gather`.
+
+```python
+class NvidiaSwarmDAG:
+    def __init__(self, max_concurrent: int = 16, timeout: float = 30.0):
+        self.max_concurrent = max_concurrent
+        self.timeout = timeout
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def __aenter__(self):
+        connector = aiohttp.TCPConnector(
+            limit=max(self.max_concurrent * 2, 32),
+            limit_per_host=self.max_concurrent,
+            enable_cleanup_closed=True,
+            force_close=False,
+            ttl_dns_cache=300,
+        )
+        ...
+```
+
+The DAG itself is submitted as a flat list of `DAGNode` objects. Each node declares its dependencies; the engine computes the ready set, fans them out, and blocks until the wave completes. No true graph is ever built. The cycle detection amounts to checking whether `ready` is empty while nodes remain pending, and the abort message is `DAG has circular dependencies or missing agents`. It is pragmatic, not elegant, and it works as long as your graph is mostly a pipeline with a few forks.
+
+The `NvidiaAgent` wrapper in `nvidia_swarm_agent.py` implements the actual inference loop against the NVIDIA NIM endpoint (`https://integrate.api.nvidia.com/v1`). Notable idiosyncrasies include:
+
+- **Llama 3.1 native prompt format.** The agent constructs prompts using `<|start_header_id|>`, `<|end_header_id|>`, and `<|eot_id|>` tokens, because OpenAI format is apparently too mainstream.
+- **Grammar-constrained JSON decoding.** Instead of relying on the NIM to emit structured tool calls, the agent injects tool schemas into the system prompt and constrains generation via regex. This is the kind of defensive coding you resort to when you have been burned by LLM JSON漂移 too many times.
+- **No validation that** `grammar `**is actually supported.** The payload adds an `extra_body` field, but there is no check whether the upstream endpoint honors it.
+
+The `lens_profile.py` module defines a `LensProfile` dataclass that maps agent archetypes (researcher, coder, analyst, orchestrator) to model choices, temperatures, concurrency limits, and KV-cache strategies (`full`, `sliding`, `sink`). There is a `LENS_REGISTRY` dict with four entries, and a helper `create_swarm_dag()` that assembles a linear chain of dependencies in the order you list them. Do not expect fan-in or diamond topologies; this DAG constructor is sequential by design.
+
+## The Three Profiles
+
+The `swarm_maximal.py` module (the subject of the `MAXIMAL_*.md` artifacts checked into root) also carries a `LENS_PROFILES` registry that is distinct from `lens_profile.py`'s `LENS_REGISTRY`. This is exactly what I mean by no single source of truth. The three profiles are:
+
+| Profile | Concurrency | Batch Size | TPS Target | Grammar Mode | Transport |
+| --- | --- | --- | --- | --- | --- |
+| `architectural` | 64 | 32 | 2500 | `regex` | `triton-grpc` |
+| `cognitive` | 32 | 16 | 1800 | `bnf` | `http2-persistent` |
+| `bleeding` | 128 | 64 | 3500 | `bnf` | `triton-grpc` |
+
+The default is `bleeding`, because of course it is. These profiles drive the `SwarmMaximal` orchestrator, which layers streaming, immediate disk persistence, and per-agent model tiers on top of the core DAG. Model tiers range from `meta/llama-3.2-90b-vision-instruct` for maximal reasoning down to `meta/llama-3.1-8b-instruct` for fast tasks. The tiering logic is hardcoded: `MAXIMAL_MODEL` for architecture and proofs, `COMPLEX_MODEL` for code, `STANDARD_MODEL` for analysis, and `FAST_MODEL` for speed.
+
+## The `archive/` Folder as Tech-Debt Stratum
+
+The `archive/` directory contains over twenty orphaned `fix_*.py` scripts. These are not organized, not imported by the main codebase, and not documented in the README. They are the sedimentary record of iterative debugging: someone hit a bug, wrote a one-off patch, ran it, and left it behind. Over time the layer thickened until it became a kind of archaeological record, which is fitting given the estate's own interest in software archaeology. See [/archaeology/sunk-cost-blueprint](/archaeology/sunk-cost-blueprint) for a meditation on how this pattern spreads.
+
+<Info>
+  The archive folder is not included in CI, not referenced by `setup.sh`, and not loaded by any import path. It is purely a hazard for anyone grepping for symbols and wondering why `fix_batch_size_3.py` redefines a function that no longer exists in the current core.
+</Info>
+
+## Workflows: CI, Benchmark, and Swarm
+
+This repository is the only one in the 233-repo toxicwind estate with GitHub Actions configured. There are three workflows, documented at [/pipelines/workflow-engine-map](/pipelines/workflow-engine-map):
+
+**ci.yml** runs on every push, pull request, and on a cron schedule of `0 */6 * * *`. Its build steps are: `py_compile src/nvidia_swarm/*.py`, `py_compile src/iptv_discovery/*.py`, and `py_compile src/benchmarks/*.py`. That is it. No unit tests, no type checks, no lint gates. Syntax validation is the only quality bar, and it passes for code that could be semantically catastrophic. The parenthetical observation that "real integration tests would cost NIM tokens" is not an excuse the CI file makes; it is simply the reality the project lives in.
+
+**benchmark.yml** fires on workflow dispatch and on a weekly cron (`0 0 * * 0`). It matrix-tests two models, `meta/llama-3.1-8b-instruct` and `meta/llama-3.1-70b-instruct`, against concurrency levels of 1, 4, 8, and 16. The output goes to `data/benchmarks/` and is uploaded as an artifact. Crucially, the benchmark step lacks the `|| true` safety net, unlike the runner in `ci.yml`.
+
+**swarm.yml** is the operational heartbeat. It triggers on `workflow_dispatch` (with inputs for task description and agent roster) and on a daily cron (`0 12 * * *`). It runs `src/nvidia_swarm/miniswarm.py` with the `NVIDIA_API_KEY` secret, then uploads `data/swarm/latest.json` as an artifact. The swarm also carries `contents:write` permissions, because it commits `data/` outputs back to the repository. This is the monetization of technical debt into literal commit history: every swarm run writes its results into git, inflating the repo with machine-generated JSONL over time.
+
+## The Case Study: OSINT Module
+
+`src/nvidia_swarm/tasks/groq_osint.py` is a concrete example of what the swarm actually does when pointed at an external API. It uses `httpx.AsyncClient` to query `https://api.groq.com/openai/v1`, confirming the August 2025 end-of-life for Groq's compound-mini model. The outputs land in `data/aug2026/*.jsonl`. The choice of `aug2026` as a directory name for data collected in 2025 is, presumably, a projection of future nostalgia.
+
+The OSINT module is the place where the swarm's theoretical DAG topology meets actual HTTP I/O. It demonstrates that the engine can orchestrate real network calls, but it also demonstrates the absence of retry logic, circuit breaking, or backoff. If Groq rate-limits the swarm, the node fails, and the DAG either skips it or halts depending on how errors propagate. In practice, with `return_exceptions=True` in `asyncio.gather`, the DAG continues with a stringified exception as the node's output.
+
+## Known Defects
+
+<AccordionGroup>
+  <Accordion title="Archive sediment without deletion">
+    Twenty-plus `fix_*.py` scripts in `archive/` represent a fossil record of bugs that were patched manually rather than fixed in source. None are imported. None are referenced by `setup.sh`. They exist because deleting code feels risky when you are the only maintainer and the CI is just `py_compile`.
+  </Accordion>
+
+  <Accordion title="CI is only syntax checking">
+    `ci.yml` runs `python -m py_compile` on the source directories. No tests, no `pytest`, no assertions. The `requirements.txt` does pin `pytest>=8.0.0` and `pytest-asyncio`, but they are never invoked in CI. Real integration tests against the NVIDIA NIM endpoint would cost tokens, and the estate has apparently decided that untested confidence is cheaper than tested caution.
+  </Accordion>
+
+  <Accordion title="parallel_tool_calls is a ghost field">
+    The `Agent`/`NvidiaAgent` dataclass includes `parallel_tool_calls: bool = True` in some iterations of the source. This field is not consulted anywhere in the execution path. It is a vestigial parameter, left behind by someone who once believed the NIM API would honor it.
+  </Accordion>
+
+  <Accordion title="Leading-space defect in .env.example">
+    The `.env.example` file contains `LENS_API_KEY= lens_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` with a literal leading space between the equals sign and the key value. Anyone who copies this into their shell export will get a key prefixed with a space. Most parsers strip it, but some do not, and the subtle corruption is maddening to debug.
+  </Accordion>
+
+  <Accordion title="browser_guard.py dwarfs the swarm core">
+    `configs/browser_guard.py` is 28KB. The DAG engine in `nvidia_swarm_core.py` is ~145 lines, or roughly 5KB of source. The browser guard is a VNC-isolation and CDP proxy enforcement script that has grown larger than the actual orchestration logic it ostensibly supports. This is the kind of sidecar creep that happens when the browser automation layer is treated as a first-class citizen while the swarm scheduler remains a weekend prototype.
+  </Accordion>
+
+  <Accordion title="pyppeteer and the unmaintained Chromium specter">
+    `requirements.txt` pins `pyppeteer>=2.0.0`. Pyppeteer is unmaintained and downloads a 170MB Chromium binary on first run. It exists because the browser automation pipeline needs a headless browser, and someone chose the Python wrapper over Playwright or Puppeteer proper. The dependency is scoped to the `iptv_discovery` and OSINT subsystems, but it bloats the install footprint for the entire project.
+  </Accordion>
+</AccordionGroup>
+
+## Cross-References
+
+If you are trying to run this on your own hardware, start at [/setup/hardware-and-runtime](/setup/hardware-and-runtime) for the base assumptions, then [/setup/zero-magic-bootstrapping](/setup/zero-magic-bootstrapping) for the honest installation instructions. The swarm workflows are catalogued alongside the estate's other pipelines at [/pipelines/workflow-engine-map](/pipelines/workflow-engine-map), and the broader philosophy of why this project accumulates stratum is explored in [/archaeology/sunk-cost-blueprint](/archaeology/sunk-cost-blueprint). For the remaining repositories in the Primary Artifacts group, see [/repos/python-sdk-auditor](/repos/python-sdk-auditor), [/repos/awesome-api-shape-explorer](/repos/awesome-api-shape-explorer), [/repos/sovereign-scripts](/repos/sovereign-scripts), [/repos/youtube-403-bypass](/repos/youtube-403-bypass), [/repos/neo-osint](/repos/neo-osint), and [/repos/peripheral-corpus](/repos/peripheral-corpus).
+
+This is the flagship. It is simultaneously the most functional and the most compromised artifact in the estate, which is exactly what you should expect from a solo-author workshop with 233 public repositories and no automated dependency scanning.

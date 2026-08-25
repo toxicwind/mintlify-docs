@@ -1,0 +1,161 @@
+---
+title: ".env, YOLO Unlocks, and De-sandbox Escalation"
+sidebarTitle: "Env and Unlocks"
+description: "Complete .env.example, the ALWAYS_ACCEPT_AND_CONTINUE unlock variable, unshare-root escalation, and the eight-kill escape hatch."
+---
+
+The daemon reads exactly one `.env`. Everything else is a lie you tell yourself about "layered configuration". This page is the whole file. Rotate anything you paste into a real deployment.
+
+## The full `.env.example`
+
+<CodeGroup>
+
+```bash .env.example
+# =========================================================================
+# CREDENTIALED (two keys total; the swarm is deliberately austere here)
+# =========================================================================
+
+# Exa: web search, contents, answer, and deep-reasoning SSE synthesis.
+# Rotate at https://dashboard.exa.ai/api-keys. The daemon expands ${EXA_API_KEY}
+# in mcp/servers.json at load time and on SIGHUP.
+EXA_API_KEY=
+
+# Context7: version-pinned library docs (Bearer auth against mcp.context7.com).
+# Rotate at https://context7.com/dashboard. OAuth variant available at /mcp/oauth
+# if you prefer browser-based auth; the daemon does not currently drive OAuth.
+CONTEXT7_API_KEY=
+
+# =========================================================================
+# LENS / TRANSPORT (only touch these if you have measured a reason to)
+# =========================================================================
+
+# NIM Triton endpoint. Default assumes a Triton gRPC on localhost:8001; override
+# for a hosted NIM. TritonGrpcTransport uses stateless_paged KV cache; do not
+# switch to `stateful` unless you are prepared to lose the checkpoint resume path.
+TRITON_URL=grpc://127.0.0.1:8001
+TRITON_MODEL=meta/llama-3.1-405b-instruct
+
+# Concurrency and timeouts. NvidiaSwarmDAG defaults are baked in; these vars
+# only override for operators running on smaller GPUs.
+SWARM_MAX_CONCURRENT=16
+SWARM_PER_TOOL_TIMEOUT_S=112.0
+SWARM_TCP_LIMIT=32
+
+# =========================================================================
+# OPTIONAL MCP SERVERS (skip at boot unless enabled)
+# =========================================================================
+
+MCP_ENABLE_NETDATA=0
+MCP_ENABLE_OHMYPOSH=0
+MCP_ENABLE_WORLDMONITOR=1   # cheap enough to leave on; bleeding lens uses it
+
+# =========================================================================
+# UNLOCKS (read the doc before setting any of these to 1)
+# =========================================================================
+
+# ALWAYS_ACCEPT_AND_CONTINUE: skip the interactive "are you sure" gate on
+# destructive ops (rm-rf against archive slots, quarantine overrides,
+# force-lens against a router veto). This is the "YOLO" mode. It exists because
+# during an active outage the gate is noise; it is not a default because outside
+# an outage the gate has caught three genuine mistakes in six months of use.
+ALWAYS_ACCEPT_AND_CONTINUE=0
+
+# DE_SANDBOX_DAEMON: mount the host root FS ("/") read-write into the daemon
+# with `unshare --mount --propagation=slave --user --map-root-user`, so agents
+# see the full file tree, not a chroot. Required for the archaeology lens on
+# repos with system-package build steps (three of the seven primaries).
+# Refuses to activate if EUID != 0 AND unprivileged userns is off.
+DE_SANDBOX_DAEMON=0
+
+# EIGHT_KILL_ESCALATION: the parent-shell watchdog. Off means "one SIGTERM,
+# then hope"; on means the SIGKILL loop described in swarm/daemon.mdx. On is
+# the correct default for anyone running the bleeding lens.
+EIGHT_KILL_ESCALATION=1
+
+# EXEC_FENCED_CODE: the argv lens picker executes code blocks in the question
+# before dispatching. Off disables execution entirely (agents receive source
+# text, not output). See swarm/pick.mdx.
+EXEC_FENCED_CODE=1
+
+# =========================================================================
+# PYPI FALLBACK (sovereign_helper.py::pip_with_fallback consumes these)
+# =========================================================================
+
+# Do not reorder. The sovereign helper walks in list order and gives up after
+# the third failure; putting a slow mirror first turns a 90s bootstrap into
+# a 12-minute one.
+PYPI_MIRRORS=https://pypi.org/simple,https://mirrors.aliyun.com/pypi/simple,https://pypi.tuna.tsinghua.edu.cn/simple
+
+# =========================================================================
+# WATCH PATHS (inotify targets; add to hot-reload allowlist)
+# =========================================================================
+
+SWARM_WATCH_REGISTRY=mcp/servers.json
+SWARM_WATCH_ENV=.env
+SWARM_WATCH_CODE=swarm/
+
+# =========================================================================
+# DO NOT COMMIT ANYTHING BELOW THIS LINE
+# =========================================================================
+# (this comment exists because python-sdk-auditor's api_key regex catches
+#  values above it, but the comment itself is the actual last line of defense)
+```
+
+</CodeGroup>
+
+<Warning>
+  The historical footgun: an early version of this file had `EXA_API_KEY= your_key_here` with a leading space after the `=`, and `python-dotenv` on Python 3.10 silently retained the space in the value, causing every Exa request to 401 with a message that _looked_ like a rotated key. The daemon now strips leading whitespace on every value at load and logs a WARN if it had to strip anything. This is why the file has zero leading whitespace anywhere; it is not a style preference.
+</Warning>
+
+## `ALWAYS_ACCEPT_AND_CONTINUE=1` — what it actually skips
+
+<Accordion title="Interactive quarantine override">
+  When the daemon quarantines an MCP server (probe timeout, non-conforming schema, 403), an operator can force it back into rotation with `swarm-cli registry unquarantine <name>`. Normally this prompts `Are you sure? (y/N)`. With `ALWAYS_ACCEPT_AND_CONTINUE=1` the prompt is skipped. Useful during a known-good remediation; dangerous during a novel outage.
+</Accordion>
+
+<Accordion title="Force-lens against router veto">
+  `swarm.pick --force-lens bleeding` on a question the router classified as `architectural` normally emits a WARN and requires `--yes`. YOLO mode skips the `--yes`. Turn this on when you are the router.
+</Accordion>
+
+<Accordion title="Archive slot rm-rf">
+  `ArchiveFS.unpack()` refuses to overwrite an existing archive slot unless the operator confirms. YOLO mode auto-confirms. Only turn this on when you have a real ArchiveFS backup elsewhere, which for the primary repos means the `additional-lens-profiles` archive shard.
+</Accordion>
+
+<Accordion title="What YOLO does NOT skip">
+  - Credential rotation prompts (the daemon refuses to start with an empty `EXA_API_KEY` and no interactive skip exists).
+  - The eight-kill escalation ceiling (`EIGHT_KILL_ESCALATION=0` and `ALWAYS_ACCEPT_AND_CONTINUE=1` do not interact).
+  - SSRF blocks in `fetch-url-raw` (those are enforced in the MCP server, not the daemon).
+  - The Triton `stateless_paged.ttl_seconds` guard.
+
+  YOLO is not "disable all safeties." It is "skip prompts I already answered in my head."
+</Accordion>
+
+## `DE_SANDBOX_DAEMON=1` — mounting `/` into the daemon
+
+The archaeology lens sometimes needs to trace a build step across the host FS: `pip_with_fallback` calls `subprocess.check_call(["pip", "install", ...])`, which needs to see `/usr/bin/pip`, `/etc/ssl/certs`, and the user's `~/.cache/pip`. When the daemon is running under a strict `unshare --mount` sandbox, those paths are hidden.
+
+Setting `DE_SANDBOX_DAEMON=1` starts the daemon under a different `unshare` invocation:
+
+```bash
+unshare --mount --propagation=slave --user --map-root-user -- \
+    python -m swarm.daemon -c mcp/servers.json --env .env
+```
+
+`--map-root-user` gives the daemon UID 0 inside its user namespace, so it can `mount --bind /` into its own view without needing real root on the host. The mount propagation is `slave`, so anything the daemon mounts is not visible to the host, but everything the host mounts is visible to the daemon. Read direction: host → daemon only.
+
+<Warning>
+  `--map-root-user` fails on kernels with `kernel.unprivileged_userns_clone=0`. Debian 12 stable ships with it off; Ubuntu 22.04 and 24.04 ship with it on. The daemon refuses to boot with `DE_SANDBOX_DAEMON=1` on a host where the userns is disabled — it does not fall back to `sudo` because a fallback that silently escalates privileges is worse than a fast failure.
+</Warning>
+
+Agents running under this daemon see `/` as read-write (subject to the host FS's own permissions on the daemon's real UID). This is deliberate. The `sovereign-scripts` repo cannot install a package into a hermetic view of `~/.local` if `~/.local` is not visible; the pip mirror cascade cannot cycle if `/etc/resolv.conf` is a private ns. De-sandboxing exists to make those two paths work; it is not general-purpose "I want more permissions."
+
+## The eight-kill escape hatch, formalized
+
+`EIGHT_KILL_ESCALATION=1` (default: on) enables both watchdogs described in [Swarm Daemon](/swarm/daemon-hot-reload):
+
+1. **In-process:** a `threading.Thread(daemon=True)` polls `time.monotonic() - loop_alive_at`. If it exceeds 150s, it fires `os.kill(os.getpid(), signal.SIGKILL)` eight times with 250ms pauses.
+2. **Out-of-process:** the parent shell installs a `trap` on `TERM`, sends `kill -TERM $PID`, waits 30s, then loops `kill -9 $PID` eight times with 250ms pauses.
+
+Both fire independently. The observed failure mode that motivated this: a `TritonGrpcTransport` call to a NIM that had OOM'd left the client-side gRPC pool holding eight FDs that only released on a hard SIGKILL. One kill released three, the second released two, the third and fourth released one each, then it stabilized. `KILL_ATTEMPTS = 8` is 2.5× the measured worst case with headroom for jitter.
+
+The escape hatch has fired twice in six months on the codex's primary daemon. In both cases, the RocksDB checkpoint let the next boot resume from the last committed step without loss.

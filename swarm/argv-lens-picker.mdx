@@ -1,0 +1,173 @@
+---
+title: "Argv Lens Picker: One Question, One Profile, One DAG"
+sidebarTitle: "Argv Lens Picker"
+description: "CLI entry point that takes a question, picks a lens profile, dispatches the swarm, and executes returned code blocks under the daemon sandbox."
+---
+
+The argv lens picker is the single-shot command line interface into the toxicwind swarm. You pass a `--question` and a `--lens`, and the picker does the rest: it resolves the lens name to a concrete `LensProfile`, instantiates `LensSwarmOrchestrator`, builds a four-node `DAGPlan`, and if the agent returns fenced code blocks it can execute them immediately. This page walks the invocation flow, the code extraction mechanics, and the sandbox dependency that makes the execution path survivable.
+
+<Steps>
+  <Step title="Invoke the picker">
+    Run the module directly with a lens and a question:
+
+    ```bash Step 1
+    python -m swarm.argv_picker \
+      --lens bleeding \
+      --question 'trace all upstream deprecation risks in <repo>'
+    ```
+
+    The `--lens` argument must match a key in `LENS_PROFILES` from `swarm_maximal.py`. The `--question` string is forwarded into the `Llama31ChatTemplate` prompt builder as the user turn.
+  </Step>
+  <Step title="Resolve lens and instantiate orchestrator">
+    The picker loads `.env` for any API keys or endpoint overrides, then resolves `LENS_PROFILES[args.lens]` into a `LensProfile` dataclass. It instantiates `LensSwarmOrchestrator(profile)`, which carries the concurrency limit, transport stub, and grammar constraint into the run.
+
+    At this point the orchestrator has a `TritonGrpcTransport` instance that, in the current codebase, is a stub: `await asyncio.sleep(0.012)` and a fake inference return. The profile is real. The transport is theater.
+  </Step>
+  <Step title="Build and run the DAGPlan">
+    The orchestrator constructs a 4-node `DAGPlan`:
+
+    1. **ingest** — clone or read the target repository
+    2. **parse** — run AST and regex analysis via `python-sdk-auditor` flag patterns
+    3. **cross-ref** — query external context (MCP registries, deprecation timelines)
+    4. **synthesize** — assemble the final `Result` with markdown output
+
+    Each `DAGNode` executes through the orchestrator's agent pool, bounded by the profile's `concurrency` field. The DAG enforces partial ordering: ingest must complete before parse, parse before cross-ref, cross-ref before synthesize.
+  </Step>
+  <Step title="Extract and optionally execute code blocks">
+    If `--exec-code` is set (the default `YOLO=1` in `.env` implies it), the picker scans the final `Result.output` for fenced code blocks. Matching blocks are piped into the sandbox executor. Bash blocks run via `subprocess.run`. Python blocks run via `exec(compile(...))`. Both paths are dangerous without containment.
+  </Step>
+  <Step title="Persist the result">
+    The final `Result` object serializes to `./runs/<ts>.json` where `<ts>` is an ISO timestamp. If `--archive` is passed, the file is written through `ArchiveFS` with magic bytes `ARFS\x01\x02`, 85MB chunking, and SHA-256 per entry. This is the same archive layer used by the daemon hot-reload path.
+  </Step>
+</Steps>
+
+## Implementation sketch
+
+The picker itself is small. It orchestrates heavy machinery through imports. Below is a plausible implementation grounded in the actual `swarm_maximal.py` types and the execution semantics described above.
+
+<CodeGroup>
+
+````python swarm/argv_picker.py
+import argparse
+import asyncio
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+from dotenv import load_dotenv
+
+from swarm_maximal import (
+    LensProfile,
+    LENS_PROFILES,
+    LensSwarmOrchestrator,
+    Result,
+)
+
+load_dotenv()
+
+YOLO = os.getenv("YOLO", "0") == "1"
+
+
+def extract_code_blocks(text: str) -> list[tuple[str, str]]:
+    """Return (lang, body) pairs from fenced blocks."""
+    return re.findall(
+        r"```(bash|python|sh)\n(.*?)```",
+        text,
+        re.DOTALL,
+    )
+
+
+def persist(result: Result, use_archive: bool = False) -> str:
+    ts = datetime.now(timezone.utc).isoformat()
+    path = f"./runs/{ts}.json"
+    os.makedirs("./runs", exist_ok=True)
+    payload = {
+        "output": result.output,
+        "metadata": result.metadata,
+        "timestamp": ts,
+    }
+    if use_archive:
+        # ArchiveFS path: magic bytes ARFS\x01\x02, 85MB chunks, SHA-256
+        from archive_fs import ArchiveFS
+        fs = ArchiveFS(chunk_bytes=85 * 1024 * 1024)
+        fs.write_json(path, payload)
+    else:
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+    return path
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser(description="Argv lens picker")
+    parser.add_argument("--lens", required=True, choices=list(LENS_PROFILES.keys()))
+    parser.add_argument("--question", required=True)
+    parser.add_argument("--exec-code", action="store_true", default=YOLO)
+    parser.add_argument("--archive", action="store_true")
+    args = parser.parse_args()
+
+    profile: LensProfile = LENS_PROFILES[args.lens]
+    orchestrator = LensSwarmOrchestrator(profile)
+    result: Result = await orchestrator.run(args.question)
+
+    if args.exec_code:
+        for lang, body in extract_code_blocks(result.output):
+            if lang in ("bash", "sh"):
+                subprocess.run(body, shell=True, check=False)
+            elif lang == "python":
+                exec(compile(body, "<agent-generated>", "exec"))
+
+    path = persist(result, use_archive=args.archive)
+    print(f"run persisted to {path}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+````
+
+</CodeGroup>
+
+The `exec(compile(...))` path is fine only inside the unshare-root sandbox described in [Daemon Hot Reload](/swarm/daemon-hot-reload). Outside that boundary it is unrestricted remote code execution against your own shell. The `subprocess.run` path with `shell=True` is equally hostile. Both are gated by `--exec-code`, but the default `YOLO=1` makes that gate a formality.
+
+## Code extraction grammar (regex, not BNF)
+
+<Accordion title="Code extraction grammar (regex, not BNF)">
+  The extractor uses this regex:
+
+  ````python
+  re.findall(
+      r"```(bash|python|sh)\n(.*?)```",
+      text,
+      re.DOTALL,
+  )
+  ````
+
+  This is a greedy-backtracking regex with a capture group per block. It matches triple-backtick fences, a language tag on the opening line, and lazily consumes everything until the closing fence. It does not validate that the language tag is real, that the code is syntactically valid, or that nested fences are handled correctly.
+
+  The same defect appears in `GrammarConstraint` from `swarm_maximal.py`: the dataclass fields advertise BNF grammar constraints, but the implementation only supports regex. The `mode` field is dead code. For a deeper treatment of this pattern, see [AST and Technical Debt](/archaeology/ast-and-technical-debt).
+</Accordion>
+
+## Lens profile fields
+
+Each `--lens` value maps to a concrete `LensProfile` with the following fields:
+
+| Lens | Concurrency | Transport | Grammar Mode |
+| --- | --- | --- | --- |
+| `architectural` | 64 | `triton-grpc` | BNF (branded) |
+| `cognitive` | 32 | `http2-persistent` | regex (actual) |
+| `bleeding` | 128 | `triton-grpc` | BNF (branded) |
+
+The `triton-grpc` transport is currently a stub that sleeps 12ms and returns synthetic data. The `http2-persistent` transport is not fully implemented in the public surface. The `grammar_mode` field is cosmetic: all profiles resolve to regex constraints at runtime. Concurrency is enforced by the orchestrator's semaphore inside `LensSwarmOrchestrator`.
+
+<Warning>
+  `--exec-code` without the daemon sandbox is unrestricted RCE against the caller's shell. The `exec()` path runs in the Python interpreter's own process. The `subprocess.run(..., shell=True)` path delegates to `/bin/sh`. Both can read your `~/.ssh`, exfiltrate environment variables, or overwrite files. Only enable this inside the unshare-root namespace sandbox documented in [Daemon Hot Reload](/swarm/daemon-hot-reload).
+</Warning>
+
+## Cross-references
+
+- [MCP Registry](/swarm/mcp-registry) — the cross-ref DAG node queries these keyless remote MCPs for deprecation context and upstream signals
+- [Daemon Hot Reload](/swarm/daemon-hot-reload) — the unshare-root sandbox that makes `--exec-code` survivable
+- [Interface Schema](/api/interface-schema) — the `Result`, `DAGNode`, and `LensProfile` dataclass definitions
+- [AST and Technical Debt](/archaeology/ast-and-technical-debt) — why the BNF grammar branding is regex under the hood, and what that costs
